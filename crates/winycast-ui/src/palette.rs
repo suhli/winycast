@@ -21,7 +21,6 @@ pub(crate) struct Colors {
     pub line: Hsla,
     pub hover: Hsla,
     pub selected: Hsla,
-    pub shadow: Hsla,
 }
 
 impl Colors {
@@ -46,7 +45,6 @@ impl Colors {
                 line: rgba(0xb7c9e42d).into(),
                 hover: rgba(0xa2bcc41a).into(),
                 selected: hsla(accent.h, 0.45, 0.47, 0.23),
-                shadow: black().opacity(0.44),
             }
         } else {
             Self {
@@ -58,7 +56,6 @@ impl Colors {
                 line: rgba(0x4067622a).into(),
                 hover: rgba(0x577a7216).into(),
                 selected: hsla(accent.h, 0.6, 0.5, 0.15),
-                shadow: black().opacity(0.27),
             }
         }
     }
@@ -656,12 +653,6 @@ impl Render for CommandPalette {
             .bg(colors.surface)
             .border_1()
             .border_color(colors.line)
-            .shadow(vec![BoxShadow {
-                color: colors.shadow,
-                offset: point(px(0.), px(6.)),
-                blur_radius: px(18.),
-                spread_radius: px(1.),
-            }])
             .font_family("Segoe UI")
             .text_color(colors.text)
             .track_focus(&self.controls)
@@ -675,7 +666,7 @@ impl Render for CommandPalette {
             .when_some(self.toast.as_ref(), |panel, (_, text)| {
                 panel.child(NotificationToast::render(text.clone(), colors))
             });
-        let panel = if self.settings.animations {
+        if self.settings.animations {
             let closing = self.closing;
             panel
                 .with_animation(
@@ -692,13 +683,7 @@ impl Render for CommandPalette {
                 .into_any_element()
         } else {
             panel.into_any_element()
-        };
-        div()
-            .size_full()
-            .px(px(19.))
-            .pt(px(15.))
-            .pb(px(23.))
-            .child(panel)
+        }
     }
 }
 

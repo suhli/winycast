@@ -80,7 +80,9 @@ fn run() -> Result<()> {
                         cx,
                     ))),
                     titlebar: None,
-                    window_background: WindowBackgroundAppearance::Transparent,
+                    // GPUI 0.2.2 maps Opaque to ACCENT_DISABLED on Windows.
+                    // DirectComposition still composites the surface's per-pixel alpha.
+                    window_background: WindowBackgroundAppearance::Opaque,
                     kind: if inspect_window {
                         WindowKind::Normal
                     } else {

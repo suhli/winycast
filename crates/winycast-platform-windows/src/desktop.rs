@@ -5,7 +5,10 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
     Graphics::{
-        Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+        Dwm::{
+            DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+            DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute, DwmSetWindowAttribute,
+        },
         Gdi::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
             MonitorFromWindow,
@@ -53,6 +56,20 @@ impl Panel {
             if !SetWindowSubclass(hwnd, Some(panel_proc), 1, 0).as_bool() {
                 return Err(anyhow!("Could not attach the launcher window subclass"));
             }
+
+            // GPUI draws the rounded panel inside this HWND.
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                std::ptr::from_ref(&DWMNCRP_DISABLED).cast(),
+                size_of_val(&DWMNCRP_DISABLED) as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                std::ptr::from_ref(&DWMWA_COLOR_NONE).cast(),
+                size_of_val(&DWMWA_COLOR_NONE) as u32,
+            );
         }
         Ok(Self {
             hwnd,

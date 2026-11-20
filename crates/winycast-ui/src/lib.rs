@@ -9,9 +9,9 @@ use std::sync::Arc;
 use gpui::Image;
 use winycast_core::{Page, Settings, Target};
 
-pub const PANEL_WIDTH: i32 = 704;
-pub const PANEL_HEIGHT: i32 = 452;
-pub const COMPACT_HEIGHT: i32 = 139;
+pub const PANEL_WIDTH: i32 = 666;
+pub const PANEL_HEIGHT: i32 = 414;
+pub const COMPACT_HEIGHT: i32 = 112;
 
 #[derive(Debug)]
 pub enum Intent {
