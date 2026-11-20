@@ -1,0 +1,9 @@
+[package]
+name = "winycast-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pinyin.workspace = true
+serde.workspace = true

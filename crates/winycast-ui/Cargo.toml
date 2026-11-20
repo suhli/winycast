@@ -1,0 +1,11 @@
+[package]
+name = "winycast-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+gpui.workspace = true
+unicode-segmentation.workspace = true
+winycast-core.workspace = true

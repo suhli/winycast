@@ -1,0 +1,25 @@
+[package]
+name = "winycast-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "winycast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+futures-lite.workspace = true
+gpui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+winycast-core.workspace = true
+winycast-platform-windows.workspace = true
+winycast-providers.workspace = true
+winycast-storage.workspace = true
+winycast-ui.workspace = true
+
+[build-dependencies]
+embed-resource = "=3.0.12"

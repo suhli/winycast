@@ -1,0 +1,13 @@
+[package]
+name = "winycast-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+winycast-core.workspace = true
+winycast-platform-windows.workspace = true
+winycast-storage.workspace = true
