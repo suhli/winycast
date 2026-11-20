@@ -11,6 +11,13 @@ use crate::{
     settings::SettingsWindow,
 };
 
+const SEARCH_TABS: [(&str, &str, Page); 4] = [
+    ("launcher-tab", "应用", Page::Launcher),
+    ("windows-tab", "窗口", Page::Windows),
+    ("clipboard-tab", "剪贴板", Page::Clipboard),
+    ("files-tab", "文件", Page::Files),
+];
+
 #[derive(Clone, Copy)]
 pub(crate) struct Colors {
     pub surface: Hsla,
@@ -78,6 +85,7 @@ pub(crate) enum Setting {
     Fullscreen,
     Startup,
     Clipboard,
+    Ocr,
     Retention,
     Clear,
 }
@@ -87,6 +95,7 @@ struct ResultList {
     index: usize,
     scroll: UniformListScrollHandle,
     pending: bool,
+    failed: bool,
 }
 
 pub struct CommandPalette {
@@ -96,6 +105,7 @@ pub struct CommandPalette {
     intents: Sender<Intent>,
     settings: Settings,
     settings_index: usize,
+    settings_scroll: ScrollHandle,
     settings_pending: bool,
     capturing_hotkey: bool,
     page: Page,
@@ -132,6 +142,7 @@ impl CommandPalette {
             intents,
             settings,
             settings_index: 0,
+            settings_scroll: ScrollHandle::new(),
             settings_pending: false,
             capturing_hotkey: false,
             page: Page::Launcher,
@@ -141,6 +152,7 @@ impl CommandPalette {
                 index: 0,
                 scroll: Default::default(),
                 pending: true,
+                failed: false,
             },
             overlay: None,
             menu_index: 0,
@@ -213,10 +225,24 @@ impl CommandPalette {
         cx.notify();
     }
 
-    pub fn results(&mut self, page: Page, query: &str, rows: Vec<Row>, cx: &mut Context<Self>) {
-        if page != self.page || query != self.query {
-            return;
+    pub fn refresh_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.page == Page::Clipboard {
+            self.refresh(cx);
         }
+    }
+
+    pub fn results(
+        &mut self,
+        page: Page,
+        query: &str,
+        rows: Option<Vec<Row>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if page != self.page || query != self.query {
+            return false;
+        }
+        self.list.failed = rows.is_none();
+        let rows = rows.unwrap_or_default();
         let old_id = self
             .list
             .rows
@@ -229,6 +255,7 @@ impl CommandPalette {
         self.list.rows = rows.into();
         self.request_preview();
         cx.notify();
+        true
     }
 
     pub fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
@@ -285,6 +312,7 @@ impl CommandPalette {
             return;
         }
         self.list.pending = true;
+        self.list.failed = false;
         self.send(Intent::Search(self.page, self.query.clone()));
     }
 
@@ -322,7 +350,7 @@ impl CommandPalette {
         self.list.scroll = Default::default();
         self.input
             .update(cx, |input, cx| input.set_text(String::new(), cx));
-        if page == Page::Settings && self.compact {
+        if matches!(page, Page::Settings | Page::Files) && self.compact {
             self.set_compact(false, cx);
         }
         self.focus(window);
@@ -431,7 +459,14 @@ impl CommandPalette {
         if let Some(overlay) = self.overlay {
             match key {
                 "escape" => self.overlay = None,
-                "up" | "down" if overlay == Overlay::Actions => self.menu_index ^= 1,
+                "up" | "down" if overlay == Overlay::Actions => {
+                    if self
+                        .selected()
+                        .is_some_and(|row| can_pin(&row.entry.target))
+                    {
+                        self.menu_index ^= 1;
+                    }
+                }
                 "enter" => self.apply_overlay(overlay, self.menu_index, cx),
                 _ => return,
             }
@@ -443,24 +478,30 @@ impl CommandPalette {
             "escape" if self.page != Page::Launcher => self.change_page(Page::Launcher, window, cx),
             "escape" => self.send(Intent::Hide),
             "," if modifiers.control => self.change_page(Page::Settings, window, cx),
+            "f" if modifiers.control => self.change_page(Page::Files, window, cx),
             "up" | "down" if self.page == Page::Settings => {
                 self.settings_index = if key == "down" {
                     (self.settings_index + 1).min(SettingsWindow::ITEMS.len() - 1)
                 } else {
                     self.settings_index.saturating_sub(1)
                 };
+                self.settings_scroll.scroll_to_item(self.settings_index);
             }
             "left" | "right" | "enter" if self.page == Page::Settings => {
                 self.edit_setting(self.settings_index, if key == "left" { -1 } else { 1 }, cx);
             }
             "tab" if self.page != Page::Settings => {
-                let pages = [Page::Launcher, Page::Windows, Page::Clipboard];
-                let index = pages
+                let index = SEARCH_TABS
                     .iter()
-                    .position(|page| *page == self.page)
+                    .position(|(_, _, page)| *page == self.page)
                     .unwrap_or(0);
+                let offset = if modifiers.shift {
+                    SEARCH_TABS.len() - 1
+                } else {
+                    1
+                };
                 self.change_page(
-                    pages[(index + if modifiers.shift { 2 } else { 1 }) % 3],
+                    SEARCH_TABS[(index + offset) % SEARCH_TABS.len()].2,
                     window,
                     cx,
                 );
@@ -545,6 +586,7 @@ impl CommandPalette {
             Setting::Fullscreen => settings.allow_fullscreen = !settings.allow_fullscreen,
             Setting::Startup => settings.startup = !settings.startup,
             Setting::Clipboard => settings.clipboard_enabled = !settings.clipboard_enabled,
+            Setting::Ocr => settings.clipboard_ocr = !settings.clipboard_ocr,
             Setting::Retention => {
                 let list = [1, 7, 30, 90];
                 settings.clipboard_days = next_item(&list, settings.clipboard_days, step);
@@ -577,7 +619,11 @@ impl Render for CommandPalette {
         let (placeholder, icon) = match self.page {
             Page::Launcher => ("搜索应用、窗口和命令…", "\u{e721}"),
             Page::Windows => ("搜索运行中的窗口…", "\u{e737}"),
+            Page::Clipboard if self.settings.clipboard_ocr => {
+                ("搜索剪贴板或图片内文字…", "\u{e77f}")
+            }
             Page::Clipboard => ("搜索剪贴板文字或图片…", "\u{e77f}"),
+            Page::Files => ("搜索 Windows 已索引的文件…", "\u{e8b7}"),
             Page::Settings => ("", "\u{e713}"),
         };
         self.input.update(cx, |input, _| {
@@ -621,6 +667,7 @@ impl Render for CommandPalette {
             Page::Settings => SettingsWindow::render(
                 &self.settings,
                 self.settings_index,
+                &self.settings_scroll,
                 self.settings_pending,
                 self.capturing_hotkey,
                 colors,
@@ -690,8 +737,14 @@ impl Render for CommandPalette {
 impl CommandPalette {
     fn render_results(&self, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
         if self.list.rows.is_empty() {
-            let status = if self.list.pending {
+            let status = if self.page == Page::Files && self.query.trim().is_empty() {
+                "输入文件名或扩展名"
+            } else if self.list.pending {
                 "正在搜索…"
+            } else if self.page == Page::Files && self.list.failed {
+                "无法读取 Windows Search 索引"
+            } else if self.page == Page::Files {
+                "Windows 索引中没有匹配的文件"
             } else if self.page == Page::Clipboard
                 && !self.settings.clipboard_enabled
                 && self.query.is_empty()
@@ -774,22 +827,21 @@ impl CommandPalette {
                     .child("↑ ↓ 选择 · ← → 调整 · Esc 返回"),
             );
         }
-        let tabs = [
-            ("launcher-tab", "应用", Page::Launcher),
-            ("windows-tab", "窗口", Page::Windows),
-            ("clipboard-tab", "剪贴板", Page::Clipboard),
-        ];
-        footer = footer.child(div().flex().items_center().gap(px(3.)).children(tabs.map(
-            |(id, title, page)| {
-                button(id, title, colors)
-                    .when(page == self.page, |tab| {
-                        tab.bg(colors.selected).text_color(colors.accent)
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.change_page(page, window, cx)),
-                    )
-            },
-        )));
+        footer = footer.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .children(SEARCH_TABS.map(|(id, title, page)| {
+                    button(id, title, colors)
+                        .when(page == self.page, |tab| {
+                            tab.bg(colors.selected).text_color(colors.accent)
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.change_page(page, window, cx)
+                        }))
+                })),
+        );
         footer.child(
             div()
                 .flex()
@@ -803,10 +855,18 @@ impl CommandPalette {
                         .on_click(cx.listener(|this, _, _, cx| this.open_actions(cx))),
                 )
                 .child(
-                    button("execute", "运行  ↵", colors)
-                        .bg(colors.selected)
-                        .text_color(colors.accent)
-                        .on_click(cx.listener(|this, _, _, cx| this.run_selected(false, cx))),
+                    button(
+                        "execute",
+                        if self.page == Page::Files {
+                            "打开  ↵"
+                        } else {
+                            "运行  ↵"
+                        },
+                        colors,
+                    )
+                    .bg(colors.selected)
+                    .text_color(colors.accent)
+                    .on_click(cx.listener(|this, _, _, cx| this.run_selected(false, cx))),
                 ),
         )
     }
@@ -829,6 +889,7 @@ impl ResultItem {
         };
         div()
             .id(("result", index))
+            .w_full()
             .h(px(42.))
             .px(px(10.))
             .flex()
@@ -899,6 +960,7 @@ impl PreviewPanel {
     fn render(row: &Row, image: Option<Preview>, colors: Colors) -> impl IntoElement {
         let category = match row.entry.target {
             Target::App(_) => "应用程序",
+            Target::File(_) => "文件",
             Target::Window(_) => "运行窗口",
             Target::Command(_) => "命令",
             Target::CopyText(_) => "计算结果",
@@ -960,12 +1022,10 @@ impl ActionMenu {
         let dialog = match overlay {
             Overlay::Actions => {
                 let row = palette.selected();
-                let verb = if row.is_some_and(|row| {
-                    matches!(row.entry.target, Target::Clip(_) | Target::CopyText(_))
-                }) {
-                    "复制"
-                } else {
-                    "运行"
+                let verb = match row.map(|row| &row.entry.target) {
+                    Some(Target::Clip(_) | Target::CopyText(_)) => "复制",
+                    Some(Target::File(_)) => "打开文件",
+                    _ => "运行",
                 };
                 let mut menu = div().flex().flex_col().gap(px(4.));
                 let pin = row.is_some_and(|row| row.pinned);
@@ -1067,6 +1127,7 @@ impl NotificationToast {
 fn target_icon(target: &Target) -> &'static str {
     match target {
         Target::App(_) => "\u{e74c}",
+        Target::File(_) => "\u{e8a5}",
         Target::Window(_) => "\u{e737}",
         Target::Command(_) => "\u{e713}",
         Target::CopyText(_) => "\u{e8ef}",

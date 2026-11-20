@@ -130,7 +130,7 @@ fn private_source() -> bool {
     }
 }
 
-fn private_text(text: &str) -> bool {
+pub(crate) fn private_text(text: &str) -> bool {
     let text = text.trim();
     let lower = text.to_ascii_lowercase();
     let digits_only = (4..=8).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
@@ -227,7 +227,7 @@ fn limits() -> Limits {
     limits
 }
 
-fn decode_png(bytes: &[u8]) -> Result<DynamicImage> {
+pub(crate) fn decode_png(bytes: &[u8]) -> Result<DynamicImage> {
     let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
     reader.limits(limits());
     Ok(reader.decode()?)

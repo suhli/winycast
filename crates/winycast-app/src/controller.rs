@@ -10,10 +10,11 @@ use anyhow::{Result, anyhow};
 use async_channel::Sender;
 use gpui::{Context, Image, ImageFormat, Window};
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use winycast_core::{ClipboardData, Command, Page, Row, Settings, Target};
 use winycast_platform_windows::{self as native, DesktopEvent, DesktopHost, Panel};
-use winycast_providers::SearchService;
+use winycast_providers::{SearchService, index_clipboard_images};
 use winycast_storage::{Storage, unix_time};
 use winycast_ui::{COMPACT_HEIGHT, CommandPalette, Intent, PANEL_HEIGHT, PANEL_WIDTH, Preview};
 
@@ -33,12 +34,19 @@ pub(crate) enum WorkerEvent {
         message: Option<&'static str>,
     },
     Completed(Result<()>, Option<&'static str>, bool),
-    ClipboardChanged(Result<bool>),
+    ClipboardChanged(Result<ClipboardChange>),
     ClipboardCleared(Result<()>),
+    ClipboardOcr(CancellationToken, Result<usize>),
     Paste(u64, Result<Option<String>>),
     Hide(u64),
     Resize(u64, i32),
     Expire,
+}
+
+pub(crate) enum ClipboardChange {
+    None,
+    History,
+    Image,
 }
 
 pub(crate) struct Controller {
@@ -60,6 +68,9 @@ pub(crate) struct Controller {
     clipboard_watching: bool,
     clipboard_clearing: bool,
     last_clipboard_seq: Option<u32>,
+    ocr_requests: watch::Sender<Option<CancellationToken>>,
+    ocr_cancel: Option<CancellationToken>,
+    ocr_error_reported: bool,
     closing: bool,
     initial_notice: Option<String>,
     trace: bool,
@@ -77,6 +88,8 @@ impl Controller {
     ) -> Self {
         let index = SearchService::new(storage.clone());
         let clipboard_watching = settings.clipboard_enabled;
+        let (ocr_requests, ocr_jobs) = watch::channel(None);
+        runtime.spawn(run_clipboard_ocr(storage.clone(), ocr_jobs, events.clone()));
         Self {
             panel,
             host,
@@ -96,6 +109,9 @@ impl Controller {
             clipboard_watching,
             clipboard_clearing: false,
             last_clipboard_seq: None,
+            ocr_requests,
+            ocr_cancel: None,
+            ocr_error_reported: false,
             closing: false,
             initial_notice: None,
             trace,
@@ -110,6 +126,7 @@ impl Controller {
             self.clipboard_watching = false;
             self.initial_notice = Some(format!("剪贴板监听未启用：{error}"));
         }
+        self.set_clipboard_ocr(self.settings.clipboard_ocr);
         self.index(false);
         if self.trace {
             eprintln!("resident: {}", !self.panel.visible());
@@ -188,11 +205,12 @@ impl Controller {
                             if self.trace {
                                 eprintln!("search: {page:?}, {} results", rows.len());
                             }
-                            ui.results(page, &query, rows, cx);
+                            ui.results(page, &query, Some(rows), cx);
                         }
                         Err(error) => {
-                            ui.results(page, &query, Vec::new(), cx);
-                            ui.toast(format!("搜索失败：{error}"), window, cx);
+                            if ui.results(page, &query, None, cx) {
+                                ui.toast(format!("搜索失败：{error}"), window, cx);
+                            }
                         }
                     }
                 }
@@ -226,14 +244,19 @@ impl Controller {
                         ui.apply_settings(self.settings.clone(), cx);
                         ui.toast(format!("无法保存设置：{error}"), window, cx);
                     } else {
+                        let ocr_changed = self.settings.clipboard_ocr != requested.clipboard_ocr;
                         self.settings = requested;
                         self.clipboard_watching = self.settings.clipboard_enabled;
                         if self.trace {
                             eprintln!("settings: saved");
                         }
                         ui.apply_settings(self.settings.clone(), cx);
+                        if ocr_changed && self.panel.visible() {
+                            ui.refresh_clipboard(cx);
+                        }
                         self.expire();
                     }
+                    self.set_clipboard_ocr(self.settings.clipboard_ocr);
                 }
                 WorkerEvent::Refresh { result, message } => match result {
                     Ok(()) => {
@@ -259,16 +282,40 @@ impl Controller {
                     }
                     Err(error) => ui.toast(format!("操作失败：{error}"), window, cx),
                 },
-                WorkerEvent::ClipboardChanged(result) => {
-                    if matches!(result, Ok(true)) && self.panel.visible() {
-                        ui.refresh(cx);
+                WorkerEvent::ClipboardChanged(result) => match result {
+                    Ok(change @ (ClipboardChange::History | ClipboardChange::Image)) => {
+                        if matches!(change, ClipboardChange::Image) {
+                            self.queue_clipboard_ocr();
+                        }
+                        if self.panel.visible() {
+                            ui.refresh_clipboard(cx);
+                        }
                     }
-                    if self.trace
-                        && let Err(error) = result
-                    {
-                        eprintln!("clipboard capture failed: {error}");
+                    Err(error) if self.trace => eprintln!("clipboard update failed: {error}"),
+                    _ => {}
+                },
+                WorkerEvent::ClipboardOcr(cancel, result) if !cancel.is_cancelled() => match result
+                {
+                    Ok(count) if count > 0 => {
+                        self.ocr_error_reported = false;
+                        if self.trace {
+                            eprintln!("clipboard OCR: indexed {count} images");
+                        }
+                        if self.panel.visible() {
+                            ui.refresh_clipboard(cx);
+                        }
                     }
-                }
+                    Err(error) if !self.ocr_error_reported => {
+                        self.ocr_error_reported = true;
+                        let message = format!("剪贴板图片文字识别失败：{error}");
+                        if self.panel.visible() {
+                            ui.toast(message, window, cx);
+                        } else if self.initial_notice.is_none() {
+                            self.initial_notice = Some(message);
+                        }
+                    }
+                    _ => {}
+                },
                 WorkerEvent::ClipboardCleared(result) => {
                     self.clipboard_clearing = false;
                     match result {
@@ -436,9 +483,10 @@ impl Controller {
         let index = self.index.clone();
         self.runtime.spawn(async move {
             if !query.is_empty() {
+                let delay = if page == Page::Files { 120 } else { 19 };
                 tokio::select! {
                     () = cancel.cancelled() => return,
-                    () = tokio::time::sleep(Duration::from_millis(19)) => {}
+                    () = tokio::time::sleep(Duration::from_millis(delay)) => {}
                 }
             }
             let result = index.search(page, query.clone(), cancel.clone()).await;
@@ -501,15 +549,39 @@ impl Controller {
         self.background(move || {
             WorkerEvent::ClipboardChanged((|| {
                 if !valid() {
-                    return Ok(false);
+                    return Ok(ClipboardChange::None);
                 }
                 if let Some(data) = native::capture(sequence)? {
+                    let change = if matches!(&data, ClipboardData::Png(_)) {
+                        ClipboardChange::Image
+                    } else {
+                        ClipboardChange::History
+                    };
                     storage.add_clip_if(data, unix_time(), days, &valid)?;
-                    return Ok(valid());
+                    if valid() {
+                        return Ok(change);
+                    }
                 }
-                Ok(false)
+                Ok(ClipboardChange::None)
             })())
         });
+    }
+
+    fn set_clipboard_ocr(&mut self, enabled: bool) {
+        if enabled && self.ocr_cancel.is_none() {
+            self.ocr_cancel = Some(CancellationToken::new());
+            self.ocr_error_reported = false;
+            self.queue_clipboard_ocr();
+        } else if !enabled && let Some(cancel) = self.ocr_cancel.take() {
+            cancel.cancel();
+            self.ocr_requests.send_replace(None);
+        }
+    }
+
+    fn queue_clipboard_ocr(&self) {
+        if let Some(cancel) = &self.ocr_cancel {
+            self.ocr_requests.send_replace(Some(cancel.clone()));
+        }
     }
 
     fn clear_clipboard(&mut self) {
@@ -526,11 +598,13 @@ impl Controller {
         let storage = self.storage.clone();
         let days = self.settings.clipboard_days;
         self.background(move || {
-            WorkerEvent::ClipboardChanged(
-                storage
-                    .expire_clips(unix_time(), days)
-                    .map(|count| count > 0),
-            )
+            WorkerEvent::ClipboardChanged(storage.expire_clips(unix_time(), days).map(|count| {
+                if count > 0 {
+                    ClipboardChange::History
+                } else {
+                    ClipboardChange::None
+                }
+            }))
         });
     }
 
@@ -588,6 +662,9 @@ impl Controller {
             Target::CopyText(text) => {
                 self.copy(ClipboardData::Text(text), Some("计算结果已复制"), false)
             }
+            Target::File(path) => self.background(move || {
+                WorkerEvent::Completed(native::launch(path.as_os_str()), None, true)
+            }),
             Target::App(_) | Target::Command(Command::System(_)) => {
                 let storage = self.storage.clone();
                 self.background(move || {
@@ -655,6 +732,9 @@ impl Controller {
             self.last_clipboard_seq = None;
         }
         self.clipboard_watching &= requested.clipboard_enabled;
+        if !requested.clipboard_ocr {
+            self.set_clipboard_ocr(false);
+        }
         let storage = self.storage.clone();
         let old_startup = self.settings.startup;
         self.background(move || {
@@ -679,6 +759,35 @@ impl Drop for Controller {
     fn drop(&mut self) {
         self.search_cancel.cancel();
         self.index_cancel.cancel();
+        self.set_clipboard_ocr(false);
         self.clipboard_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+async fn run_clipboard_ocr(
+    storage: Storage,
+    mut requests: watch::Receiver<Option<CancellationToken>>,
+    events: Sender<WorkerEvent>,
+) {
+    while requests.changed().await.is_ok() {
+        let request = requests.borrow_and_update().clone();
+        let Some(cancel) = request.filter(|cancel| !cancel.is_cancelled()) else {
+            continue;
+        };
+        let storage = storage.clone();
+        let worker_cancel = cancel.clone();
+        let result =
+            tokio::task::spawn_blocking(move || index_clipboard_images(&storage, &worker_cancel))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+        if !cancel.is_cancelled()
+            && events
+                .send(WorkerEvent::ClipboardOcr(cancel, result))
+                .await
+                .is_err()
+        {
+            break;
+        }
     }
 }

@@ -41,9 +41,9 @@ use windows::{
 };
 use winycast_core::{Entry, SystemCommand, Target, WindowTarget};
 
-struct Apartment;
+pub(crate) struct Apartment;
 impl Apartment {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         }
@@ -170,7 +170,7 @@ pub fn launch(target: &OsStr) -> Result<()> {
         )
     };
     if result.0 as isize <= 32 {
-        bail!("Windows Shell 无法打开此应用（错误 {}）", result.0 as isize);
+        bail!("Windows Shell 无法打开此项目（错误 {}）", result.0 as isize);
     }
     Ok(())
 }

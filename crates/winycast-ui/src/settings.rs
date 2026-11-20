@@ -7,7 +7,7 @@ use crate::palette::{Colors, CommandPalette, Setting, edit_setting};
 pub struct SettingsWindow;
 
 impl SettingsWindow {
-    pub(crate) const ITEMS: [(Setting, &'static str); 10] = [
+    pub(crate) const ITEMS: [(Setting, &'static str); 11] = [
         (Setting::Theme, "主题"),
         (Setting::Accent, "主题色"),
         (Setting::Opacity, "背景透明度"),
@@ -16,6 +16,7 @@ impl SettingsWindow {
         (Setting::Fullscreen, "允许在全屏应用上唤出"),
         (Setting::Startup, "登录 Windows 时启动"),
         (Setting::Clipboard, "剪贴板记录"),
+        (Setting::Ocr, "剪贴板图片文字识别"),
         (Setting::Retention, "未固定条目保留天数"),
         (Setting::Clear, "清空剪贴板历史"),
     ];
@@ -23,6 +24,7 @@ impl SettingsWindow {
     pub(crate) fn render(
         settings: &Settings,
         selected: usize,
+        scroll: &ScrollHandle,
         pending: bool,
         capture: bool,
         colors: Colors,
@@ -58,6 +60,7 @@ impl SettingsWindow {
                 "已暂停"
             }
             .to_owned(),
+            on_off(settings.clipboard_ocr),
             format!("{} 天", settings.clipboard_days),
             "清空…".into(),
         ];
@@ -65,6 +68,7 @@ impl SettingsWindow {
             .id("settings-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(scroll)
             .p(px(10.))
             .when(pending, |panel| panel.opacity(0.65))
             .children(Self::ITEMS.into_iter().zip(values).enumerate().map(

@@ -1,15 +1,21 @@
+mod clipboard_ocr;
+
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, anyhow};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use winycast_core::{Entry, Page, Row, Target, calculate, commands, rank};
 use winycast_storage::Storage;
+
+pub use clipboard_ocr::index_clipboard_images;
 
 #[derive(Clone)]
 pub struct SearchService {
     apps: Arc<RwLock<Arc<[Entry]>>>,
     commands: Arc<[Entry]>,
     storage: Storage,
+    file_query_slot: Arc<Mutex<()>>,
 }
 
 impl SearchService {
@@ -18,6 +24,7 @@ impl SearchService {
             apps: Arc::default(),
             commands: commands().into(),
             storage,
+            file_query_slot: Arc::default(),
         }
     }
 
@@ -45,10 +52,25 @@ impl SearchService {
         query: String,
         cancel: CancellationToken,
     ) -> Result<Vec<Row>> {
+        let file_slot = if page == Page::Files {
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            // Let the current OLE DB call return before starting another file query.
+            Some(tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(Vec::new()),
+                slot = self.file_query_slot.clone().lock_owned() => slot,
+            })
+        } else {
+            None
+        };
         let service = self.clone();
         let search = cancel.clone();
-        let job =
-            tokio::task::spawn_blocking(move || service.search_blocking(page, &query, &search));
+        let job = tokio::task::spawn_blocking(move || {
+            let _file_slot = file_slot;
+            service.search_blocking(page, &query, &search)
+        });
         tokio::select! {
             biased;
             () = cancel.cancelled() => Ok(Vec::new()),
@@ -67,6 +89,26 @@ impl SearchService {
         }
         if page == Page::Clipboard {
             return self.storage.clips(query, || cancel.is_cancelled());
+        }
+        if page == Page::Files {
+            return Ok(
+                winycast_platform_windows::search_files(query, || cancel.is_cancelled())?
+                    .into_iter()
+                    .filter_map(|path| {
+                        let title = path.file_name()?.to_string_lossy().into_owned();
+                        let detail = path.to_string_lossy().into_owned();
+                        Some(Row {
+                            entry: Entry::display(
+                                format!("file:{detail}"),
+                                title,
+                                detail,
+                                Target::File(path),
+                            ),
+                            pinned: false,
+                        })
+                    })
+                    .collect(),
+            );
         }
         let apps = self
             .apps

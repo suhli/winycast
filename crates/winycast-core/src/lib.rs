@@ -12,6 +12,7 @@ pub enum Page {
     Launcher,
     Windows,
     Clipboard,
+    Files,
     Settings,
 }
 
@@ -51,6 +52,12 @@ pub fn commands() -> Vec<Entry> {
             Page(crate::Page::Settings),
         ),
         (
+            "files",
+            "搜索文件",
+            "File Search Windows Search 文件搜索",
+            Page(crate::Page::Files),
+        ),
+        (
             "windows-settings",
             "打开 Windows 设置",
             "Windows Settings",
@@ -86,6 +93,7 @@ pub fn commands() -> Vec<Entry> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
     App(std::ffi::OsString),
+    File(std::path::PathBuf),
     Window(WindowTarget),
     Command(Command),
     CopyText(String),
@@ -129,6 +137,7 @@ pub struct Settings {
     pub allow_fullscreen: bool,
     pub startup: bool,
     pub clipboard_enabled: bool,
+    pub clipboard_ocr: bool,
     pub clipboard_days: u16,
 }
 
@@ -143,6 +152,7 @@ impl Default for Settings {
             allow_fullscreen: false,
             startup: false,
             clipboard_enabled: false,
+            clipboard_ocr: false,
             clipboard_days: 30,
         }
     }

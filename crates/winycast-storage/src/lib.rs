@@ -28,6 +28,7 @@ impl Storage {
         connection.execute_batch(
             "PRAGMA journal_mode = DELETE;
              PRAGMA secure_delete = ON;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY CHECK(id = 1),
                 value TEXT NOT NULL
@@ -46,7 +47,11 @@ impl Storage {
                 seen INTEGER NOT NULL,
                 pinned INTEGER NOT NULL DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS clipboard_order ON clipboard(pinned DESC, seen DESC, id DESC);",
+             CREATE INDEX IF NOT EXISTS clipboard_order ON clipboard(pinned DESC, seen DESC, id DESC);
+             CREATE TABLE IF NOT EXISTS clipboard_image_ocr (
+                clip_id INTEGER PRIMARY KEY REFERENCES clipboard(id) ON DELETE CASCADE,
+                search_text TEXT NOT NULL
+             );",
         )?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
@@ -76,11 +81,16 @@ impl Storage {
 
     pub fn save_settings(&self, settings: &Settings) -> Result<()> {
         self.with(|connection| {
-            connection.execute(
+            let tx = connection.transaction()?;
+            tx.execute(
                 "INSERT INTO settings (id, value) VALUES (1, ?1)
                  ON CONFLICT(id) DO UPDATE SET value = excluded.value",
                 [serde_json::to_string(settings)?],
             )?;
+            if !settings.clipboard_ocr {
+                tx.execute("DELETE FROM clipboard_image_ocr", [])?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -165,13 +175,14 @@ impl Storage {
         self.with(|connection| {
             let mut stmt = connection.prepare(
                 "SELECT id, kind, substr(text, 1, 768), pinned
-                 FROM clipboard
+                 FROM clipboard LEFT JOIN clipboard_image_ocr ON clip_id = id
                  WHERE ?1 = '' OR case kind
                     WHEN 0 THEN instr(lower(text), lower(?1)) > 0
-                    ELSE instr('图片 image png', lower(?1)) > 0 END
+                    ELSE instr('图片 image png', lower(?1)) > 0
+                        OR (?2 <> '' AND instr(search_text, ?2) > 0) END
                  ORDER BY pinned DESC, seen DESC, id DESC LIMIT 500",
             )?;
-            let mut rows = stmt.query([query.trim()])?;
+            let mut rows = stmt.query(params![query.trim(), ocr_search_text(query)])?;
             let mut results = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancelled() {
@@ -220,6 +231,40 @@ impl Storage {
         })
     }
 
+    pub fn pending_image_ocr(&self) -> Result<Vec<i64>> {
+        self.with(|connection| {
+            let mut query = connection.prepare(
+                "SELECT id FROM clipboard LEFT JOIN clipboard_image_ocr ON clip_id = id
+                 WHERE kind = 1 AND clip_id IS NULL
+                 ORDER BY pinned DESC, seen DESC, id DESC",
+            )?;
+            let images = query.query_map([], |row| row.get(0))?;
+            Ok(images.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub fn save_image_ocr(
+        &self,
+        id: i64,
+        text: &str,
+        cancelled: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        let text = ocr_search_text(text);
+        self.with(|connection| {
+            if cancelled() {
+                return Ok(false);
+            }
+            Ok(connection.execute(
+                "INSERT OR IGNORE INTO clipboard_image_ocr (clip_id, search_text)
+                 SELECT id, ?2 FROM clipboard
+                 WHERE id = ?1 AND kind = 1 AND EXISTS (
+                    SELECT 1 FROM settings WHERE id = 1 AND json_extract(value, '$.clipboard_ocr') = 1
+                 )",
+                params![id, text],
+            )? != 0)
+        })
+    }
+
     pub fn toggle_clip_pin(&self, id: i64) -> Result<()> {
         self.with(|connection| {
             connection.execute(
@@ -240,6 +285,14 @@ impl Storage {
     pub fn expire_clips(&self, now: i64, days: u16) -> Result<usize> {
         self.with(|connection| expire(connection, now, days))
     }
+}
+
+fn ocr_search_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .take(16_384)
+        .collect()
 }
 
 fn expire(connection: &Connection, now: i64, days: u16) -> Result<usize> {
@@ -294,6 +347,60 @@ mod tests {
         assert!(matches!(storage.clip(id)?, Some(ClipboardData::Text(_))));
         storage.clear_clips()?;
         assert!(storage.clips("", || false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn image_ocr_search_requires_opt_in_and_cleans_up_with_history() -> Result<()> {
+        let storage = Storage::configure(Connection::open_in_memory()?)?;
+        storage.add_clip(ClipboardData::Png(vec![1]), 1, 30)?;
+        storage.add_clip(ClipboardData::Png(vec![2]), 2, 30)?;
+        let ids = storage.pending_image_ocr()?;
+        assert_eq!(ids.len(), 2);
+        let (pinned, other) = (ids[0], ids[1]);
+        assert!(!storage.save_image_ocr(pinned, "private by default", || false)?);
+        assert!(storage.clips("private by default", || false)?.is_empty());
+
+        let enabled = Settings {
+            clipboard_ocr: true,
+            ..Settings::default()
+        };
+        storage.save_settings(&enabled)?;
+        assert!(!storage.save_image_ocr(pinned, "cancelled", || true)?);
+        assert_eq!(storage.pending_image_ocr()?, ids);
+        assert!(storage.save_image_ocr(pinned, "中 文 识 别\nWinycast OCR", || false)?);
+        assert!(storage.save_image_ocr(other, "expires", || false)?);
+        assert!(storage.pending_image_ocr()?.is_empty());
+        assert_eq!(
+            storage.clips("中文识别", || false)?[0].entry.target,
+            Target::Clip(pinned)
+        );
+        assert_eq!(storage.clips("winycast ocr", || false)?.len(), 1);
+        assert_eq!(storage.clips("png", || false)?.len(), 2);
+
+        storage.toggle_clip_pin(pinned)?;
+        assert_eq!(storage.expire_clips(172800, 1)?, 1);
+        assert!(storage.clips("expires", || false)?.is_empty());
+        assert!(!storage.save_image_ocr(other, "stale", || false)?);
+
+        storage.save_settings(&Settings::default())?;
+        assert!(storage.clips("中文识别", || false)?.is_empty());
+        assert_eq!(storage.clips("png", || false)?.len(), 1);
+        assert!(!storage.save_image_ocr(pinned, "stale", || false)?);
+        assert_eq!(storage.pending_image_ocr()?, vec![pinned]);
+
+        storage.save_settings(&enabled)?;
+        assert!(storage.save_image_ocr(pinned, "before clear", || false)?);
+        storage.clear_clips()?;
+        assert!(!storage.save_image_ocr(pinned, "stale", || false)?);
+        let indexed = storage.with(|connection| {
+            Ok(
+                connection.query_row("SELECT count(*) FROM clipboard_image_ocr", [], |row| {
+                    row.get::<_, u32>(0)
+                })?,
+            )
+        })?;
+        assert_eq!(indexed, 0);
         Ok(())
     }
 }
