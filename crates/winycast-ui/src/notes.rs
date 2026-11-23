@@ -207,8 +207,7 @@ impl CommandPalette {
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.change_page(Page::Notes, window, cx);
-        if self.note_editor.is_some() {
+        if self.resume_unsaved_note(window, cx) {
             return;
         }
         let session = self.next_note_request();
@@ -216,14 +215,25 @@ impl CommandPalette {
     }
 
     pub fn load_note(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.note_editor.is_some() {
-            self.change_page(Page::Notes, window, cx);
-            self.toast("请先返回当前笔记列表", window, cx);
+        if self.resume_unsaved_note(window, cx) {
             return;
         }
         let request = self.next_note_request();
         self.loading_note = Some(request);
         self.send(Intent::LoadNote { request, id });
+    }
+
+    fn resume_unsaved_note(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self
+            .note_editor
+            .as_ref()
+            .is_some_and(|editor| editor.saving.is_some() || editor.dirty(cx))
+        {
+            return false;
+        }
+        self.change_page(Page::Notes, window, cx);
+        self.toast("请先保存或关闭当前笔记", window, cx);
+        true
     }
 
     fn open_note_editor(

@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod controller;
+#[cfg(test)]
+mod note_test;
 
 use std::{cell::RefCell, ffi::OsString, path::PathBuf, rc::Rc};
 

@@ -1,4 +1,4 @@
-use std::mem::size_of;
+use std::{mem::size_of, net::IpAddr};
 
 use windows::Win32::{
     Foundation::HWND,
@@ -116,6 +116,7 @@ impl ShortcutContext {
                 (UIA_AutomationIdPropertyId, "urlbar-input"),
                 (UIA_NamePropertyId, "Address and search bar"),
                 (UIA_NamePropertyId, "地址栏和搜索栏"),
+                (UIA_NamePropertyId, "地址和搜索栏"),
             ]
             .into_iter();
             let (property, name) = names.next()?;
@@ -218,8 +219,21 @@ fn browser_address(value: &str) -> Option<String> {
     if let Some(address) = web_address(value) {
         return Some(address.into());
     }
-    // Chromium can elide HTTPS in an unfocused address field.
-    if value.contains([':', '@', '\\']) || value.contains(char::is_whitespace) {
+    // Chromium can omit the scheme in its unfocused address field.
+    if value.contains(['@', '\\']) || value.contains(char::is_whitespace) {
+        return None;
+    }
+    let local = web_address(&format!("http://{value}"))?;
+    let host = local.host_str()?;
+    if host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Some(local.into());
+    }
+    if value.contains(':') {
         return None;
     }
     let address = web_address(&format!("https://{value}"))?;
@@ -255,6 +269,19 @@ mod tests {
             browser_address("http://localhost:8000/").as_deref(),
             Some("http://localhost:8000/")
         );
+        assert_eq!(
+            browser_address("127.0.0.1:8000/docs").as_deref(),
+            Some("http://127.0.0.1:8000/docs")
+        );
+        assert_eq!(
+            browser_address("[::1]:8000/docs").as_deref(),
+            Some("http://[::1]:8000/docs")
+        );
+        assert_eq!(
+            browser_address("https://localhost:8000/").as_deref(),
+            Some("https://localhost:8000/")
+        );
+        assert!(browser_address("example.org:invalid/docs").is_none());
         assert!(browser_address("search words.example.org").is_none());
         assert!(browser_address("file:///C:/sample").is_none());
     }

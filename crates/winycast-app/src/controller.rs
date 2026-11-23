@@ -1011,7 +1011,7 @@ mod tests {
             );
         }
         assert_eq!(storage.shortcuts(|| false)?.len(), 2);
-        assert_eq!(storage.clip(id)?, Some(ClipboardData::Text(url.into())));
+        assert!(matches!(storage.clip(id)?, Some(ClipboardData::Text(text)) if text == url));
         Ok(())
     }
 }

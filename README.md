@@ -26,7 +26,7 @@ cargo build --release --locked
 
 - 输入应用名、拼音、拼音首字母或不完整名称即可搜索。例如 `jisuanqi` 和 `jsq` 可以匹配名为「计算器」的索引条目。
 - **↑ / ↓** 移动选中项，**Enter** 执行，**Ctrl + K** 打开操作菜单，**Ctrl + D** 收藏或固定。收藏与成功使用记录参与启动器的排序。
-- **Tab / Shift + Tab** 在应用、窗口、剪贴板、文件和常用项之间切换。运行窗口页会列出当前可切换的顶层窗口。**Ctrl + Space** 收起或展开，**Esc** 从子页面返回，继续按一次隐藏面板。
+- **Tab / Shift + Tab** 在应用、窗口、剪贴板、文件、常用和笔记之间切换。运行窗口页会列出当前可切换的顶层窗口。**Ctrl + Space** 收起或展开，**Esc** 从子页面返回，继续按一次隐藏面板。
 - **Ctrl + F** 打开文件页，也可从启动器执行「搜索文件」。输入文件名、词组或扩展名，按 **Enter** 用默认应用打开选中的文件。结果来自本机 Windows Search 索引，按修改时间从新到旧排列，最多 100 项。搜索范围由 Windows 的索引设置决定。
 - 在搜索框输入 `2+3*4`、`2^8` 或 `=sqrt(81)` 可直接显示结果。按 **Enter** 将结果复制到剪贴板。
 - 在设置页用方向键调整选项。可更改主题、主题色、透明度、动画、全局热键、全屏策略、开机启动和剪贴板保留天数。按 **Enter** 录制热键时，支持 Ctrl、Alt、Shift、Win 配合字母、数字、空格或可用的功能键。注册失败会在面板中提示，并保留当前可用热键。
@@ -46,6 +46,12 @@ cargo build --release --locked
 
 首页搜索框为空时，会根据使用次数和最近使用时间推荐最多五个已有条目，并在条目下方显示「建议」。收藏排在建议之前。
 
+### Markdown 笔记
+
+- 在「笔记」页按 **Ctrl + N**，或在启动器运行「新建 Markdown 笔记」。用 **Tab** 切换标题和正文，按 **Ctrl + S** 保存。关闭有未保存更改的笔记时会要求确认。面板失焦隐藏后可以继续编辑。
+- 主搜索和「笔记」页都能按标题、标题拼音和正文关键词查找。按 **Enter** 打开预览，用 **Ctrl + P** 在编辑和预览间切换。原生预览支持标题、强调、引用、列表、任务项、代码与链接文本。
+- 在笔记列表按 **Ctrl + K** 可删除选中项，删除前需要确认。每篇笔记的正文最多 64 KiB，Markdown 原文保存在本机 SQLite 中。
+
 ## 参考与实现
 
 Tinycast 提供了键盘交互、搜索框加列表、底部操作提示、焦点丢失后隐藏等设计参考。Winycast 自行实现 Windows 界面、交互和命令，无 Tinycast 的 Swift 源码、品牌或素材。[Tinycast 界面文档](https://github.com/abue-ammar/tinycast/blob/main/docs/ui.md) · [Tinycast 许可证](https://github.com/abue-ammar/tinycast/blob/main/LICENSE)
@@ -53,10 +59,10 @@ Tinycast 提供了键盘交互、搜索框加列表、底部操作提示、焦�
 使用 Zed 官方发布的 `gpui = "=0.2.2"`，Windows 后端使用 DirectX、DirectWrite 和 DirectComposition。GPUI 暴露原生窗口句柄和文本输入接口。Winycast 的清单声明 Common Controls v6 和 Per-Monitor V2，窗口生命周期由 Win32 事件驱动，通过 HWND 适配层管理。GPUI Kit 的组件和虚拟列表设计用于参考，应用使用自定义 GPUI 组件。[GPUI 0.2.2](https://crates.io/crates/gpui/0.2.2) · [Zed GPUI 源码](https://github.com/zed-industries/zed/tree/main/crates/gpui) · [GPUI Kit](https://github.com/longbridge/gpui-kit)
 
 - `winycast-app` 管理程序生命周期和事件，协调 Tokio 后台任务。
-- `winycast-ui` 提供搜索输入、虚拟列表、预览、操作菜单、剪贴板页和设置页。
+- `winycast-ui` 提供搜索输入、虚拟列表、预览、操作菜单、剪贴板页、笔记编辑器和设置页。
 - `winycast-core` 定义命令、搜索项、设置、拼音匹配及计算器。
 - `winycast-platform-windows` 实现全局热键、托盘、单实例、活动显示器定位、原生窗口切换、应用启动、剪贴板读写和 Windows OCR 适配。
-- `winycast-storage` 管理 SQLite 设置、排序历史、收藏、剪贴板数据和图片文字索引。
+- `winycast-storage` 管理 SQLite 设置、排序历史、收藏、剪贴板数据、图片文字索引和 Markdown 笔记。
 - `winycast-providers` 在可取消的后台任务中扫描应用、搜索窗口及历史数据、查询 Windows Search 文件索引，并索引剪贴板图片文字。
 
 应用扫描读取 Windows AppsFolder 和用户及公共开始菜单。主面板重复使用同一个 HWND 与输入实体。搜索任务按请求取消，发布前核对请求和视图状态。窗口关闭、剪贴板变更和托盘交互由 Windows 派发事件。
@@ -70,6 +76,8 @@ Tinycast 提供了键盘交互、搜索框加列表、底部操作提示、焦�
 调试构建可用 `--trace-window` 输出索引规模、结果数量、显示状态以及窗口激活耗时，日志不含查询文字或剪贴板内容。`--inspect-window` 让调试面板出现在任务栏，便于被桌面测试工具定位。正式版使用无任务栏工具窗口。
 
 已启用 Windows Search 且索引中包含快捷方式时，可用 `cargo test --workspace --locked reads_files_from_live_windows_index -- --ignored` 复测文件查询和路径解析。
+
+可用 `cargo test --workspace --locked note_editor_draws_and_preserves_draft_through_preview_and_save -- --ignored` 复测 Windows GPUI 窗口中的编辑、预览、保存和草稿保留。此测试使用隐藏窗口和合成文本。中文输入法候选及前台操作仍需要桌面验收。
 
 在上述 Windows 11 环境，免安装 Release 已用独立数据库验证后台启动时可为合成图片建立中英文文字索引。安装 Windows 的英语和简体中文 OCR 语言包后，可用 `cargo test --workspace --locked indexes_synthetic_screenshot_with_windows_ocr -- --ignored` 复测图片识别及历史搜索。微软将 `Windows.Media.Ocr` 的桌面支持范围限定为具备包标识的应用。免安装版的可用性取决于本机系统，识别失败时剪贴板历史仍可使用。[微软 Windows OCR 文档](https://learn.microsoft.com/en-us/uwp/api/windows.media.ocr)
 
