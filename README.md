@@ -62,3 +62,16 @@ Tinycast 提供了键盘交互、搜索框加列表、底部操作提示、焦�
 在上述 Windows 11 环境，免安装 Release 已用独立数据库验证后台启动时可为合成图片建立中英文文字索引。安装 Windows 的英语和简体中文 OCR 语言包后，可用 `cargo test --workspace --locked indexes_synthetic_screenshot_with_windows_ocr -- --ignored` 复测图片识别及历史搜索。微软将 `Windows.Media.Ocr` 的桌面支持范围限定为具备包标识的应用。免安装版的可用性取决于本机系统，识别失败时剪贴板历史仍可使用。[微软 Windows OCR 文档](https://learn.microsoft.com/en-us/uwp/api/windows.media.ocr)
 
 建议在包含 100% 和 150% 缩放的双屏 Windows 11 上分别聚焦两个屏幕上的应用，再用热键召唤，检查位置、像素比例、边角和候选窗口的位置。用微软拼音输入，检查拼写中的下划线、高亮候选、空格与 Enter 确认、Escape 取消候选，以及切出再召回后的提交状态。还应分别检查热键切换、点击窗口外部、独占全屏策略、托盘菜单、登录启动、剪贴板真实事件和长时间常驻资源。用测试数据目录验收剪贴板的过期与清空。
+
+## Windows 性能基线
+
+构建 Release 后，退出正在运行的 Winycast，再从 Windows 桌面会话执行：
+
+```powershell
+.\scripts\measure-windows.ps1 -IdleSeconds 120
+.\scripts\measure-windows.ps1 -IdleSeconds 30 -PanelCycles 25
+```
+
+脚本使用 `target/measurement-*` 下的独立数据库，并输出 CPU 时间、工作集、私有内存和句柄数。第二条命令会发送默认热键并反复开合测试面板，测试字符只发给该面板。运行时让桌面保持解锁并暂停操作，避免窗口切换影响采样。脚本用应用日志记录激活与搜索结果到达时间，可以看到样本数和失败原因。合成热键到日志的时间包含日志采样开销，屏幕呈现时间需要单独测量。
+
+首轮基线使用 Windows 11 Release，应用索引为 411 项。120 秒空闲采样的工作集从 63.29 MiB 变为 63.01 MiB，私有内存从 97.46 MiB 变为 97.23 MiB，平均 CPU 为单核的 0.286%，句柄数从 573 变为 563。一次由系统热键触发的应用内激活耗时 55 ms。自动化热键送达不稳定，输入时延、重复开合和长时间驻留仍待验收。

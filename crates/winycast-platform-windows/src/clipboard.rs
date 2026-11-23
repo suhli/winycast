@@ -79,13 +79,7 @@ impl Opened {
     }
 
     fn text(&self) -> Option<String> {
-        let bytes = self.data(UNICODE_TEXT, MAX_TEXT_BYTES)?;
-        let wide: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .take_while(|&unit| unit != 0)
-            .collect();
-        String::from_utf16(&wide).ok()
+        decode_text(&self.data(UNICODE_TEXT, MAX_TEXT_BYTES)?)
     }
 }
 impl Drop for Opened {
@@ -98,6 +92,15 @@ impl Drop for Opened {
 
 fn has(format: u32) -> bool {
     format != 0 && unsafe { IsClipboardFormatAvailable(format).is_ok() }
+}
+
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    let wide: Vec<_> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16(&wide).ok()
 }
 
 fn private_source() -> bool {
@@ -182,7 +185,6 @@ pub fn capture(sequence: u32) -> Result<Option<ClipboardData>> {
     let clipboard = Opened::open(None)?;
     if unsafe { GetClipboardSequenceNumber() } != sequence
         || private_source()
-        || has(FILE_LIST)
         || has(FORMATS.excluded)
         || has(FORMATS.password_manager)
         || (has(FORMATS.os_history)
@@ -193,30 +195,46 @@ pub fn capture(sequence: u32) -> Result<Option<ClipboardData>> {
         return Ok(None);
     }
 
-    let png = clipboard.data(FORMATS.png, MAX_ENCODED_BYTES);
-    let dib = if png.is_none() {
-        clipboard
-            .data(DIB_V5, MAX_DIB_BYTES)
-            .or_else(|| clipboard.data(DIB, MAX_DIB_BYTES))
-    } else {
-        None
-    };
-    let text = if png.is_none() && dib.is_none() {
-        clipboard.text()
-    } else {
-        None
-    };
+    let snapshot = read_snapshot(FORMATS.png, has(FILE_LIST), |format, limit| {
+        clipboard.data(format, limit)
+    });
     drop(clipboard);
-    if let Some(png) = png {
-        decode_png(&png)?;
-        return Ok(Some(ClipboardData::Png(png)));
+
+    match snapshot {
+        Some(Snapshot::Png(png)) => {
+            decode_png(&png)?;
+            Ok(Some(ClipboardData::Png(png)))
+        }
+        Some(Snapshot::Dib(dib)) => Ok(Some(ClipboardData::Png(dib_to_png(dib)?))),
+        Some(Snapshot::Text(bytes)) => Ok(decode_text(&bytes)
+            .filter(|text| !text.trim().is_empty() && !private_text(text))
+            .map(ClipboardData::Text)),
+        None => Ok(None),
     }
-    if let Some(dib) = dib {
-        return Ok(Some(ClipboardData::Png(dib_to_png(dib)?)));
+}
+
+enum Snapshot {
+    Png(Vec<u8>),
+    Dib(Vec<u8>),
+    Text(Vec<u8>),
+}
+
+fn read_snapshot(
+    png_format: u32,
+    has_file_list: bool,
+    read: impl Fn(u32, usize) -> Option<Vec<u8>>,
+) -> Option<Snapshot> {
+    // Some sources publish both a bitmap and a file list for the copied image.
+    if let Some(png) = read(png_format, MAX_ENCODED_BYTES) {
+        return Some(Snapshot::Png(png));
     }
-    Ok(text
-        .filter(|text| !text.trim().is_empty() && !private_text(text))
-        .map(ClipboardData::Text))
+    if let Some(dib) = read(DIB_V5, MAX_DIB_BYTES).or_else(|| read(DIB, MAX_DIB_BYTES)) {
+        return Some(Snapshot::Dib(dib));
+    }
+    if has_file_list {
+        return None;
+    }
+    read(UNICODE_TEXT, MAX_TEXT_BYTES).map(Snapshot::Text)
 }
 
 fn limits() -> Limits {
@@ -332,6 +350,25 @@ impl Drop for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_is_captured_alongside_a_file_list() {
+        let png_format = 0xc000;
+        let bitmap = read_snapshot(png_format, true, |format, _| {
+            (format == DIB_V5).then(|| vec![1, 2, 3])
+        });
+        assert!(matches!(bitmap, Some(Snapshot::Dib(bytes)) if bytes == [1, 2, 3]));
+
+        let png = read_snapshot(png_format, true, |format, _| {
+            (format == png_format || format == DIB_V5).then(|| vec![4, 5, 6])
+        });
+        assert!(matches!(png, Some(Snapshot::Png(bytes)) if bytes == [4, 5, 6]));
+
+        let only_files = read_snapshot(png_format, true, |format, _| {
+            (format == UNICODE_TEXT).then(|| vec![65, 0])
+        });
+        assert!(only_files.is_none());
+    }
 
     #[test]
     fn recognizes_sensitive_and_ordinary_text() {
