@@ -109,7 +109,11 @@ impl ShortcutEditor {
     }
 }
 
-pub(crate) fn field(label: &'static str, input: Entity<SearchInput>, colors: Colors) -> impl IntoElement {
+pub(crate) fn field(
+    label: &'static str,
+    input: Entity<SearchInput>,
+    colors: Colors,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_col()

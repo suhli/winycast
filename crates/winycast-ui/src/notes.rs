@@ -63,7 +63,11 @@ impl NoteEditor {
 
     pub(super) fn focus_field(&self, cx: &App) -> Option<FocusHandle> {
         (self.mode == NoteMode::Edit).then(|| {
-            let field = if self.version.is_some() { &self.body } else { &self.title };
+            let field = if self.version.is_some() {
+                &self.body
+            } else {
+                &self.title
+            };
             field.read(cx).focus.clone()
         })
     }
@@ -77,37 +81,71 @@ impl NoteEditor {
             || self.body.read(cx).text() != self.baseline.markdown
     }
 
-    pub(super) fn heading(&self) -> SharedString {
+    pub(super) fn heading(&self, cx: &App) -> SharedString {
         if self.mode == NoteMode::Edit {
-            return if self.version.is_some() { "编辑笔记" } else { "新建笔记" }.into();
+            return if self.version.is_some() {
+                "编辑笔记"
+            } else {
+                "新建笔记"
+            }
+            .into();
         }
-        self.baseline.title.clone().into()
+        let title = self.title.read(cx).text().trim();
+        if title.is_empty() {
+            "笔记预览".into()
+        } else {
+            title.to_owned().into()
+        }
     }
 
-    pub(super) fn mode_button(&self, colors: Colors, cx: &mut Context<CommandPalette>) -> AnyElement {
+    pub(super) fn mode_button(
+        &self,
+        colors: Colors,
+        cx: &mut Context<CommandPalette>,
+    ) -> AnyElement {
         button(
             "note-preview-toggle",
-            if self.mode == NoteMode::Edit { "预览" } else { "编辑" },
+            if self.mode == NoteMode::Edit {
+                "预览"
+            } else {
+                "编辑"
+            },
             colors,
         )
         .on_click(cx.listener(|palette, _, window, cx| palette.toggle_note_preview(window, cx)))
         .into_any_element()
     }
 
-    pub(super) fn footer(&self, footer: Div, colors: Colors, cx: &mut Context<CommandPalette>) -> Div {
+    pub(super) fn footer(
+        &self,
+        footer: Div,
+        colors: Colors,
+        cx: &mut Context<CommandPalette>,
+    ) -> Div {
         let status = self.error.clone().unwrap_or_else(|| {
             if self.mode == NoteMode::Edit {
                 "Tab 切换输入框 · Ctrl + P 预览"
             } else {
                 "↑ ↓ 滚动 · Ctrl + P 编辑"
-            }.into()
+            }
+            .into()
         });
         footer
-            .child(div().min_w_0().truncate().text_color(colors.muted).child(status))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.muted)
+                    .child(status),
+            )
             .child(
                 button(
                     "note-save",
-                    if self.saving.is_some() { "正在保存…" } else { "保存  Ctrl S" },
+                    if self.saving.is_some() {
+                        "正在保存…"
+                    } else {
+                        "保存  Ctrl S"
+                    },
                     colors,
                 )
                 .flex_shrink_0()
@@ -124,9 +162,20 @@ impl NoteEditor {
                     input.style("输入标题", colors.text, colors.muted, colors.accent);
                 });
                 self.body.update(cx, |input, _| {
-                    input.style("输入 Markdown 正文", colors.text, colors.muted, colors.accent);
+                    input.style(
+                        "输入 Markdown 正文",
+                        colors.text,
+                        colors.muted,
+                        colors.accent,
+                    );
                 });
-                div().flex().flex_col().gap(px(10.)).px(px(20.)).py(px(12.)).text_size(px(12.))
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .px(px(20.))
+                    .py(px(12.))
+                    .text_size(px(12.))
                     .child(field("标题", self.title.clone(), colors))
                     .child(field("正文", self.body.clone(), colors))
                     .into_any_element()
@@ -147,7 +196,9 @@ impl NoteEditor {
 
 impl CommandPalette {
     pub(super) fn active_note(&self) -> Option<&NoteEditor> {
-        self.note_editor.as_ref().filter(|_| self.page == Page::Notes)
+        self.note_editor
+            .as_ref()
+            .filter(|_| self.page == Page::Notes)
     }
 
     fn next_note_request(&mut self) -> u64 {
@@ -210,7 +261,9 @@ impl CommandPalette {
     }
 
     fn toggle_note_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_note() else { return };
+        let Some(editor) = self.active_note() else {
+            return;
+        };
         if self.overlay.is_some() || editor.composing(cx) {
             return;
         }
@@ -227,7 +280,12 @@ impl CommandPalette {
         cx.notify();
     }
 
-    pub fn note_preview(&mut self, request: u64, blocks: Vec<MarkdownBlock>, cx: &mut Context<Self>) {
+    pub fn note_preview(
+        &mut self,
+        request: u64,
+        blocks: Vec<MarkdownBlock>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(editor) = &mut self.note_editor
             && editor.mode == NoteMode::Rendering(request)
         {
@@ -239,8 +297,12 @@ impl CommandPalette {
     }
 
     fn save_note(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = &mut self.note_editor else { return };
-        if self.overlay.is_some() || editor.saving.is_some() || editor.composing(cx)
+        let Some(editor) = &mut self.note_editor else {
+            return;
+        };
+        if self.overlay.is_some()
+            || editor.saving.is_some()
+            || editor.composing(cx)
             || (editor.version.is_some() && !editor.dirty(cx))
         {
             return;
@@ -251,7 +313,11 @@ impl CommandPalette {
         };
         match draft.clone().validated() {
             Ok(valid) => {
-                let intent = Intent::SaveNote { session: editor.session, version: editor.version, draft: valid };
+                let intent = Intent::SaveNote {
+                    session: editor.session,
+                    version: editor.version,
+                    draft: valid,
+                };
                 editor.error = None;
                 editor.saving = Some(draft);
                 self.send(intent);
@@ -268,8 +334,16 @@ impl CommandPalette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.note_editor.as_mut().filter(|editor| editor.session == session) else { return };
-        let Some(sent) = editor.saving.take() else { return };
+        let Some(editor) = self
+            .note_editor
+            .as_mut()
+            .filter(|editor| editor.session == session)
+        else {
+            return;
+        };
+        let Some(sent) = editor.saving.take() else {
+            return;
+        };
         match result {
             Ok(note) => {
                 editor.version = Some(note.version);
@@ -278,7 +352,9 @@ impl CommandPalette {
                     && editor.title.read(cx).text() == sent.title
                     && sent.title != editor.baseline.title
                 {
-                    editor.title.update(cx, |title, cx| title.set_text(editor.baseline.title.clone(), cx));
+                    editor.title.update(cx, |title, cx| {
+                        title.set_text(editor.baseline.title.clone(), cx)
+                    });
                 }
                 self.request_search();
                 self.toast("笔记已保存", window, cx);
@@ -289,7 +365,9 @@ impl CommandPalette {
     }
 
     pub(super) fn close_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_note() else { return };
+        let Some(editor) = self.active_note() else {
+            return;
+        };
         if self.overlay.is_some() || editor.saving.is_some() || editor.composing(cx) {
             return;
         }
@@ -311,8 +389,15 @@ impl CommandPalette {
         cx.notify();
     }
 
-    pub(super) fn note_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_note() else { return };
+    pub(super) fn note_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_note() else {
+            return;
+        };
         if self.closing || editor.composing(cx) {
             return;
         }
@@ -322,10 +407,16 @@ impl CommandPalette {
             "escape" => self.close_note(window, cx),
             "s" | "enter" if mods.control && !event.is_held => self.save_note(cx),
             "p" if mods.control && !event.is_held => self.toggle_note_preview(window, cx),
+            "," if mods.control => self.change_page(Page::Settings, window, cx),
             "tab" if editor.mode == NoteMode::Edit => {
                 let title = &editor.title.read(cx).focus;
                 let body = &editor.body.read(cx).focus;
-                if title.is_focused(window) { body } else { title }.focus(window);
+                if title.is_focused(window) {
+                    body
+                } else {
+                    title
+                }
+                .focus(window);
             }
             "up" | "down" | "pageup" | "pagedown" if editor.mode == NoteMode::Preview => {
                 editor.scroll.scroll_by(px(match key {
@@ -343,8 +434,15 @@ impl CommandPalette {
 }
 
 fn preview_status(message: &'static str, colors: Colors) -> AnyElement {
-    div().size_full().flex().items_center().justify_center().text_color(colors.muted)
-        .text_size(px(14.)).child(message).into_any_element()
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(colors.muted)
+        .text_size(px(14.))
+        .child(message)
+        .into_any_element()
 }
 
 fn render_block(block: &MarkdownBlock, colors: Colors) -> AnyElement {
@@ -359,30 +457,53 @@ fn render_block(block: &MarkdownBlock, colors: Colors) -> AnyElement {
                 MarkdownBlockKind::Heading(_) => 17.,
                 _ => 14.,
             };
-            let runs = block.spans.iter().map(|span| {
-                let style = span.style;
-                let mut face = font(if style.code { "Consolas" } else { "Segoe UI" });
-                if style.strong || matches!(kind, MarkdownBlockKind::Heading(_)) {
-                    face = face.bold();
-                }
-                if style.emphasis {
-                    face = face.italic();
-                }
-                TextRun {
-                    len: span.len,
-                    font: face,
-                    color: if style.link { colors.accent } else { colors.text },
-                    background_color: (style.code && !code).then_some(colors.hover),
-                    underline: style.link.then_some(UnderlineStyle { thickness: px(1.), color: None, wavy: false }),
-                    strikethrough: style.strike.then_some(StrikethroughStyle { thickness: px(1.), color: None }),
-                }
-            }).collect();
-            content.text_size(px(size)).line_height(px(size + 7.))
-                .when(code, |block| block.bg(colors.hover).rounded(px(6.)).p(px(8.)))
+            let runs = block
+                .spans
+                .iter()
+                .map(|span| {
+                    let style = span.style;
+                    let mut face = font(if style.code { "Consolas" } else { "Segoe UI" });
+                    if style.strong || matches!(kind, MarkdownBlockKind::Heading(_)) {
+                        face = face.bold();
+                    }
+                    if style.emphasis {
+                        face = face.italic();
+                    }
+                    TextRun {
+                        len: span.len,
+                        font: face,
+                        color: if style.link {
+                            colors.accent
+                        } else {
+                            colors.text
+                        },
+                        background_color: (style.code && !code).then_some(colors.hover),
+                        underline: style.link.then_some(UnderlineStyle {
+                            thickness: px(1.),
+                            color: None,
+                            wavy: false,
+                        }),
+                        strikethrough: style.strike.then_some(StrikethroughStyle {
+                            thickness: px(1.),
+                            color: None,
+                        }),
+                    }
+                })
+                .collect();
+            content
+                .text_size(px(size))
+                .line_height(px(size + 7.))
+                .when(code, |block| {
+                    block.bg(colors.hover).rounded(px(6.)).p(px(8.))
+                })
                 .child(StyledText::new(block.text.clone()).with_runs(runs))
         }
     };
-    div().px(px(20.)).py(px(5.)).child(
-        content.when(block.quoted, |block| block.border_l_2().border_color(colors.accent).pl(px(9.))),
-    ).into_any_element()
+    div()
+        .px(px(20.))
+        .py(px(5.))
+        .child(content.when(block.quoted, |block| {
+            block.border_l_2().border_color(colors.accent).pl(px(9.))
+        }))
+        .into_any_element()
 }

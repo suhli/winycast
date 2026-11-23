@@ -14,7 +14,8 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use winycast_core::{
-    ClipboardData, Command, Page, Row, Settings, ShortcutDraft, ShortcutKind, Target, web_address,
+    ClipboardData, Command, MarkdownBlock, Note, Page, Row, Settings, ShortcutDraft, ShortcutKind,
+    Target, markdown_preview, web_address,
 };
 use winycast_platform_windows::{
     self as native, DesktopEvent, DesktopHost, Panel, ShortcutContext,
@@ -47,6 +48,9 @@ pub(crate) enum WorkerEvent {
     Paste(u64, FocusHandle, Result<Option<String>>),
     ShortcutLoaded(u64, Result<(Option<i64>, ShortcutDraft)>),
     ShortcutSaved(u64, Result<i64>),
+    NoteLoaded(u64, Result<(Note, Vec<MarkdownBlock>)>),
+    NoteSaved(u64, Result<Note>),
+    NotePreview(u64, Vec<MarkdownBlock>),
     Hide(u64),
     Resize(u64, i32),
     Expire,
@@ -259,6 +263,39 @@ impl Controller {
                         message: Some("已删除常用项"),
                     });
                 }
+                Intent::LoadNote { request, id } => {
+                    let storage = self.storage.clone();
+                    self.background(move || {
+                        let result = storage.note(id).and_then(|note| {
+                            let note = note.ok_or_else(|| anyhow!("笔记已删除"))?;
+                            let preview = markdown_preview(&note.draft.markdown);
+                            Ok((note, preview))
+                        });
+                        WorkerEvent::NoteLoaded(request, result)
+                    });
+                }
+                Intent::SaveNote {
+                    session,
+                    version,
+                    draft,
+                } => {
+                    let storage = self.storage.clone();
+                    self.background(move || {
+                        WorkerEvent::NoteSaved(session, storage.save_note(version, draft))
+                    });
+                }
+                Intent::DeleteNote(id) => {
+                    let storage = self.storage.clone();
+                    self.background(move || WorkerEvent::Refresh {
+                        result: storage.delete_note(id),
+                        message: Some("已删除笔记"),
+                    });
+                }
+                Intent::RenderNote { request, markdown } => {
+                    self.background(move || {
+                        WorkerEvent::NotePreview(request, markdown_preview(&markdown))
+                    });
+                }
             },
             Event::Worker(event) => match event {
                 WorkerEvent::Search(seq, page, query, result) if seq == self.search_seq => {
@@ -413,6 +450,23 @@ impl Controller {
                         cx,
                     );
                 }
+                WorkerEvent::NoteLoaded(request, result) if self.panel.active() => {
+                    ui.note_loaded(
+                        request,
+                        result.map_err(|error| error.to_string()),
+                        window,
+                        cx,
+                    );
+                }
+                WorkerEvent::NoteSaved(session, result) => {
+                    ui.note_saved(
+                        session,
+                        result.map_err(|error| error.to_string()),
+                        window,
+                        cx,
+                    );
+                }
+                WorkerEvent::NotePreview(request, blocks) => ui.note_preview(request, blocks, cx),
                 WorkerEvent::Hide(seq) if seq == self.visibility_seq && self.closing => {
                     self.hide_now(true, ui, cx)
                 }
@@ -709,6 +763,8 @@ impl Controller {
             Target::Command(Command::CreateShortcut(kind)) => {
                 ui.create_shortcut_from_context(kind, cx);
             }
+            Target::Command(Command::CreateNote) => ui.new_note(window, cx),
+            Target::Note(note) => ui.load_note(note, window, cx),
             Target::Command(Command::Rescan) => {
                 self.index(true);
                 self.record_use(id);
@@ -934,14 +990,28 @@ mod tests {
             panic!("expected a clipboard target");
         };
         for kind in [ShortcutKind::Snippet, ShortcutKind::Quicklink] {
-            let (existing, draft) =
+            let (existing, mut draft) =
                 load_shortcut(&storage, ShortcutSource::Clipboard(id, kind), None)?;
             assert_eq!(existing, None);
             assert_eq!(draft.kind, kind);
             assert_eq!(draft.body, url);
+            assert_eq!(
+                storage.shortcuts(|| false)?.len(),
+                if kind == ShortcutKind::Snippet { 0 } else { 1 }
+            );
+            draft.title = "用户修改的标题".into();
+            draft.body = match kind {
+                ShortcutKind::Snippet => "编辑后的文本\n第二行".into(),
+                ShortcutKind::Quicklink => "https://example.org/edited".into(),
+            };
+            let saved = storage.save_shortcut(existing, draft.clone())?;
+            assert_eq!(
+                storage.shortcut(saved)?.expect("saved shortcut").draft,
+                draft
+            );
         }
-        assert!(storage.shortcuts(|| false)?.is_empty());
-        assert_eq!(storage.clips("", || false)?.len(), 1);
+        assert_eq!(storage.shortcuts(|| false)?.len(), 2);
+        assert_eq!(storage.clip(id)?, Some(ClipboardData::Text(url.into())));
         Ok(())
     }
 }

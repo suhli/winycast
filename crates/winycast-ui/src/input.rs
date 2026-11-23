@@ -318,14 +318,11 @@ impl SearchInput {
             .count();
         let top = (active + 1).saturating_sub(self.layout.rows);
         let mut start = 0;
-        let ranges = self
-            .text
-            .split('\n')
-            .map(|line| {
-                let range = start..start + line.len();
-                start = range.end + 1;
-                range
-            });
+        let ranges = self.text.split('\n').map(|line| {
+            let range = start..start + line.len();
+            start = range.end + 1;
+            range
+        });
         let empty = self.text.is_empty();
         let lines = ranges
             .skip(top)

@@ -15,12 +15,17 @@ use crate::{
     shortcuts::ShortcutEditor,
 };
 
-const SEARCH_TABS: [(&str, &str, Page); 5] = [
+#[path = "notes.rs"]
+mod notes;
+use notes::NoteEditor;
+
+const SEARCH_TABS: [(&str, &str, Page); 6] = [
     ("launcher-tab", "应用", Page::Launcher),
     ("windows-tab", "窗口", Page::Windows),
     ("clipboard-tab", "剪贴板", Page::Clipboard),
     ("files-tab", "文件", Page::Files),
     ("shortcuts-tab", "常用", Page::Shortcuts),
+    ("notes-tab", "笔记", Page::Notes),
 ];
 
 #[derive(Clone, Copy)]
@@ -79,6 +84,8 @@ enum Overlay {
     ConfirmSystem,
     ConfirmClear,
     ConfirmDeleteShortcut(i64),
+    ConfirmDeleteNote(i64),
+    ConfirmDiscardNote,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +94,7 @@ enum ResultAction {
     Pin,
     EditShortcut,
     DeleteShortcut,
+    DeleteNote,
     SaveClipboardAs(ShortcutKind),
 }
 
@@ -94,6 +102,7 @@ fn result_actions(target: &Target) -> &'static [ResultAction] {
     use ResultAction::*;
     match target {
         Target::Shortcut(..) => &[Run, EditShortcut, Pin, DeleteShortcut],
+        Target::Note(_) => &[Run, DeleteNote],
         Target::Clip(_, ClipKind::Text) => &[Run, Pin, SaveClipboardAs(ShortcutKind::Snippet)],
         Target::Clip(_, ClipKind::Link) => &[
             Run,
@@ -149,6 +158,9 @@ pub struct CommandPalette {
     shortcut_request: u64,
     loading_shortcut: Option<u64>,
     shortcut_editor: Option<ShortcutEditor>,
+    note_request: u64,
+    loading_note: Option<u64>,
+    note_editor: Option<NoteEditor>,
     compact: bool,
     opening: usize,
     closing: bool,
@@ -168,6 +180,7 @@ impl CommandPalette {
             this.list.index = 0;
             this.overlay = None;
             this.loading_shortcut = None;
+            this.loading_note = None;
             this.request_search();
             cx.notify();
         });
@@ -197,6 +210,9 @@ impl CommandPalette {
             shortcut_request: 0,
             loading_shortcut: None,
             shortcut_editor: None,
+            note_request: 0,
+            loading_note: None,
+            note_editor: None,
             compact: false,
             opening: 0,
             closing: false,
@@ -221,6 +237,12 @@ impl CommandPalette {
     fn focus(&self, window: &mut Window, cx: &App) {
         if let Some(editor) = &self.shortcut_editor {
             editor.title.read(cx).focus.focus(window);
+        } else if let Some(editor) = self.active_note() {
+            editor
+                .focus_field(cx)
+                .as_ref()
+                .unwrap_or(&self.controls)
+                .focus(window);
         } else if self.page == Page::Settings {
             self.controls.focus(window);
         } else {
@@ -239,6 +261,7 @@ impl CommandPalette {
         self.overlay = None;
         self.capturing_hotkey = false;
         self.loading_shortcut = None;
+        self.loading_note = None;
         self.cancel_composition(cx);
         cx.notify();
     }
@@ -254,11 +277,18 @@ impl CommandPalette {
     pub fn cancel_composition(&mut self, cx: &mut Context<Self>) {
         self.input
             .update(cx, |input, cx| input.cancel_composition(cx));
-        if let Some(editor) = &self.shortcut_editor {
-            for field in editor.fields() {
+        if let Some(fields) = self.editor_fields() {
+            for field in fields {
                 field.update(cx, |field, cx| field.cancel_composition(cx));
             }
         }
+    }
+
+    fn editor_fields(&self) -> Option<[&Entity<SearchInput>; 2]> {
+        self.shortcut_editor
+            .as_ref()
+            .map(ShortcutEditor::fields)
+            .or_else(|| self.active_note().map(NoteEditor::fields))
     }
 
     pub fn paste_input(
@@ -271,9 +301,8 @@ impl CommandPalette {
         if self.page == Page::Settings || self.closing || !focus.is_focused(window) {
             return;
         }
-        let field = match &self.shortcut_editor {
-            Some(editor) => editor
-                .fields()
+        let field = match self.editor_fields() {
+            Some(fields) => fields
                 .into_iter()
                 .find(|field| &field.read(cx).focus == focus),
             None => (&self.input_focused == focus).then_some(&self.input),
@@ -371,7 +400,10 @@ impl CommandPalette {
     }
 
     fn request_search(&mut self) {
-        if self.page == Page::Settings || self.shortcut_editor.is_some() {
+        if self.page == Page::Settings
+            || self.shortcut_editor.is_some()
+            || self.active_note().is_some()
+        {
             return;
         }
         self.list.pending = true;
@@ -418,6 +450,7 @@ impl CommandPalette {
         self.cancel_composition(cx);
         self.shortcut_editor = None;
         self.loading_shortcut = None;
+        self.loading_note = None;
         self.page = page;
         self.query.clear();
         self.overlay = None;
@@ -429,7 +462,11 @@ impl CommandPalette {
         self.list.scroll = Default::default();
         self.input
             .update(cx, |input, cx| input.set_text(String::new(), cx));
-        if matches!(page, Page::Settings | Page::Files | Page::Shortcuts) && self.compact {
+        if matches!(
+            page,
+            Page::Settings | Page::Files | Page::Shortcuts | Page::Notes
+        ) && self.compact
+        {
             self.set_compact(false, cx);
         }
         self.focus(window, cx);
@@ -541,7 +578,7 @@ impl CommandPalette {
         }
         if let Some(overlay) = self.overlay {
             match key {
-                "escape" => self.overlay = None,
+                "escape" => self.cancel_overlay(window, cx),
                 "up" | "down" if overlay == Overlay::Actions => {
                     if let Some(row) = self.selected() {
                         let count = result_actions(&row.entry.target).len();
@@ -549,11 +586,15 @@ impl CommandPalette {
                         self.menu_index = (self.menu_index + offset) % count;
                     }
                 }
-                "enter" => self.apply_overlay(overlay, self.menu_index, cx),
+                "enter" => self.apply_overlay(overlay, self.menu_index, window, cx),
                 _ => return,
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if self.active_note().is_some() {
+            self.note_key(event, window, cx);
             return;
         }
         match key {
@@ -563,6 +604,9 @@ impl CommandPalette {
             "f" if modifiers.control => self.change_page(Page::Files, window, cx),
             "n" if modifiers.control && self.page == Page::Shortcuts => {
                 self.new_shortcut(window, cx);
+            }
+            "n" if modifiers.control && self.page == Page::Notes => {
+                self.new_note(window, cx);
             }
             "p" if modifiers.control && self.page == Page::Clipboard => {
                 self.toggle_clipboard_links(cx)
@@ -811,7 +855,20 @@ impl CommandPalette {
         }
     }
 
-    fn apply_overlay(&mut self, overlay: Overlay, index: usize, cx: &mut Context<Self>) {
+    fn cancel_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.take() == Some(Overlay::ConfirmDiscardNote) {
+            self.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_overlay(
+        &mut self,
+        overlay: Overlay,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match overlay {
             Overlay::Actions => {
                 let Some(row) = self.selected().filter(|_| !self.list.pending) else {
@@ -826,6 +883,9 @@ impl CommandPalette {
                     }
                     (Some(ResultAction::DeleteShortcut), Target::Shortcut(id, _)) => {
                         self.overlay = Some(Overlay::ConfirmDeleteShortcut(*id));
+                    }
+                    (Some(ResultAction::DeleteNote), Target::Note(id)) => {
+                        self.overlay = Some(Overlay::ConfirmDeleteNote(*id));
                     }
                     (Some(ResultAction::SaveClipboardAs(kind)), Target::Clip(id, _)) => {
                         self.load_shortcut(ShortcutSource::Clipboard(*id, *kind), cx);
@@ -842,6 +902,11 @@ impl CommandPalette {
                 self.overlay = None;
                 self.send(Intent::DeleteShortcut(id));
             }
+            Overlay::ConfirmDeleteNote(id) => {
+                self.overlay = None;
+                self.send(Intent::DeleteNote(id));
+            }
+            Overlay::ConfirmDiscardNote => self.discard_note(window, cx),
         }
         cx.notify();
     }
@@ -909,7 +974,7 @@ impl Render for CommandPalette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::new(&self.settings, window.appearance());
         let (placeholder, icon) = match self.page {
-            Page::Launcher => ("搜索应用、窗口和命令…", "\u{e721}"),
+            Page::Launcher => ("搜索应用、命令和笔记…", "\u{e721}"),
             Page::Windows => ("搜索运行中的窗口…", "\u{e737}"),
             Page::Clipboard | Page::ClipboardLinks if self.clipboard_links => {
                 ("搜索剪贴板链接…", "\u{e71b}")
@@ -920,21 +985,26 @@ impl Render for CommandPalette {
             Page::Clipboard | Page::ClipboardLinks => ("搜索剪贴板文字或图片…", "\u{e77f}"),
             Page::Files => ("搜索 Windows 已索引的文件…", "\u{e8b7}"),
             Page::Shortcuts => ("搜索常用文本和快捷链接…", "\u{e734}"),
+            Page::Notes => ("搜索笔记标题和正文…", "\u{e70b}"),
             Page::Settings => ("", "\u{e713}"),
         };
         self.input.update(cx, |input, _| {
             input.style(placeholder, colors.text, colors.muted, colors.accent)
         });
         let editor = self.shortcut_editor.as_ref();
-        let heading = editor
-            .map(|editor| {
-                if editor.id.is_some() {
-                    "编辑常用项"
-                } else {
-                    "新建常用项"
-                }
+        let note = self.active_note();
+        let heading = note
+            .map(|note| note.heading(cx))
+            .or_else(|| {
+                editor.map(|editor| {
+                    if editor.id.is_some() {
+                        "编辑常用项".into()
+                    } else {
+                        "新建常用项".into()
+                    }
+                })
             })
-            .or((self.page == Page::Settings).then_some("Winycast 设置"));
+            .or((self.page == Page::Settings).then(|| "Winycast 设置".into()));
         let search = div()
             .h(px(62.))
             .flex_shrink_0()
@@ -948,6 +1018,8 @@ impl Render for CommandPalette {
             .child(if let Some(heading) = heading {
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .text_size(px(21.))
                     .child(heading)
                     .into_any_element()
@@ -984,7 +1056,27 @@ impl Render for CommandPalette {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_clipboard_links(cx))),
                 )
             })
-            .child(if editor.is_some() {
+            .when(self.page == Page::Notes && note.is_none(), |header| {
+                header.child(
+                    button("new-note", "新建笔记", colors)
+                        .bg(colors.selected)
+                        .text_color(colors.accent)
+                        .on_click(cx.listener(|this, _, window, cx| this.new_note(window, cx))),
+                )
+            })
+            .child(if let Some(note) = note {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(note.mode_button(colors, cx))
+                    .child(
+                        button("back-to-notes", "返回", colors).on_click(
+                            cx.listener(|this, _, window, cx| this.close_note(window, cx)),
+                        ),
+                    )
+                    .into_any_element()
+            } else if editor.is_some() {
                 button("cancel-shortcut", "取消", colors)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.close_shortcut_editor(window, cx)),
@@ -1005,18 +1097,22 @@ impl Render for CommandPalette {
                 .on_click(cx.listener(|this, _, _, cx| this.set_compact(!this.compact, cx)))
                 .into_any_element()
             });
-        let body = match (editor, self.page) {
-            (Some(editor), _) => editor.render(colors, cx),
-            (None, Page::Settings) => SettingsWindow::render(
-                &self.settings,
-                self.settings_index,
-                &self.settings_scroll,
-                self.settings_pending,
-                self.capturing_hotkey,
-                colors,
-                cx,
-            ),
-            _ => self.render_results(colors, cx),
+        let body = if let Some(note) = note {
+            note.render(colors, cx)
+        } else {
+            match (editor, self.page) {
+                (Some(editor), _) => editor.render(colors, cx),
+                (None, Page::Settings) => SettingsWindow::render(
+                    &self.settings,
+                    self.settings_index,
+                    &self.settings_scroll,
+                    self.settings_pending,
+                    self.capturing_hotkey,
+                    colors,
+                    cx,
+                ),
+                _ => self.render_results(colors, cx),
+            }
         };
         let body = div()
             .flex_1()
@@ -1099,6 +1195,8 @@ impl CommandPalette {
                 "尚无剪贴板记录"
             } else if self.page == Page::Shortcuts && self.query.is_empty() {
                 "按 Ctrl + N 新建常用文本或快捷链接"
+            } else if self.page == Page::Notes && self.query.is_empty() && !self.list.failed {
+                "按 Ctrl + N 新建 Markdown 笔记"
             } else {
                 "没有找到匹配结果"
             };
@@ -1166,6 +1264,9 @@ impl CommandPalette {
             .border_t_1()
             .border_color(colors.line)
             .text_size(px(12.));
+        if let Some(note) = self.active_note() {
+            return note.footer(footer, colors, cx);
+        }
         if let Some(editor) = &self.shortcut_editor {
             return footer
                 .child(
@@ -1228,7 +1329,9 @@ impl CommandPalette {
                         "execute",
                         match self.selected().map(|row| &row.entry.target) {
                             Some(Target::Shortcut(_, ShortcutKind::Snippet)) => "复制  ↵",
-                            Some(Target::Shortcut(_, ShortcutKind::Quicklink)) => "打开  ↵",
+                            Some(
+                                Target::Shortcut(_, ShortcutKind::Quicklink) | Target::Note(_),
+                            ) => "打开  ↵",
                             _ if self.page == Page::Files => "打开  ↵",
                             _ => "运行  ↵",
                         },
@@ -1256,6 +1359,7 @@ impl ResultItem {
             Target::Clip(_, ClipKind::Link) => "剪贴板链接".into(),
             Target::Clip(..) => "剪贴板".into(),
             Target::Shortcut(_, kind) => kind.label().into(),
+            Target::Note(_) => "Markdown 笔记".into(),
             _ => row.entry.detail.clone(),
         };
         let subtitle = if row.suggested {
@@ -1343,6 +1447,7 @@ impl PreviewPanel {
             Target::Clip(_, ClipKind::Link) => "剪贴板链接",
             Target::Clip(..) => "剪贴板",
             Target::Shortcut(_, kind) => kind.label(),
+            Target::Note(_) => "Markdown 笔记",
         };
         div()
             .w(px(200.))
@@ -1408,6 +1513,7 @@ impl ActionMenu {
                                 | Target::CopyText(_)
                                 | Target::Shortcut(_, ShortcutKind::Snippet) => "复制",
                                 Target::File(_) => "打开文件",
+                                Target::Note(_) => "打开笔记",
                                 Target::Shortcut(_, ShortcutKind::Quicklink) => "在浏览器打开",
                                 _ => "运行",
                             },
@@ -1420,7 +1526,7 @@ impl ActionMenu {
                                 }
                             }
                             ResultAction::EditShortcut => "编辑",
-                            ResultAction::DeleteShortcut => "删除",
+                            ResultAction::DeleteShortcut | ResultAction::DeleteNote => "删除",
                             ResultAction::SaveClipboardAs(ShortcutKind::Snippet) => "存为常用文本",
                             ResultAction::SaveClipboardAs(ShortcutKind::Quicklink) => {
                                 "存为快捷链接"
@@ -1429,25 +1535,27 @@ impl ActionMenu {
                         menu = menu.child(
                             button(("entry-action", index), label, colors)
                                 .when(palette.menu_index == index, |item| item.bg(colors.selected))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.apply_overlay(overlay, index, cx)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.apply_overlay(overlay, index, window, cx)
                                 })),
                         );
                     }
                 }
                 menu
             }
-            Overlay::ConfirmSystem | Overlay::ConfirmClear | Overlay::ConfirmDeleteShortcut(_) => {
-                let title = if overlay == Overlay::ConfirmClear {
-                    "清空全部剪贴板历史？"
-                } else if matches!(overlay, Overlay::ConfirmDeleteShortcut(_)) {
-                    "删除这个常用项？"
-                } else if palette.selected().is_some_and(|row| {
-                    row.entry.target == Target::Command(Command::System(SystemCommand::Sleep))
-                }) {
-                    "让 Windows 进入睡眠？"
-                } else {
-                    "锁定 Windows 屏幕？"
+            _ => {
+                let title = match overlay {
+                    Overlay::ConfirmClear => "清空全部剪贴板历史？",
+                    Overlay::ConfirmDeleteShortcut(_) => "删除这个常用项？",
+                    Overlay::ConfirmDeleteNote(_) => "删除这篇笔记？",
+                    Overlay::ConfirmDiscardNote => "放弃未保存的更改？",
+                    _ if palette.selected().is_some_and(|row| {
+                        row.entry.target == Target::Command(Command::System(SystemCommand::Sleep))
+                    }) =>
+                    {
+                        "让 Windows 进入睡眠？"
+                    }
+                    _ => "锁定 Windows 屏幕？",
                 };
                 div()
                     .flex()
@@ -1459,19 +1567,14 @@ impl ActionMenu {
                             .flex()
                             .justify_end()
                             .gap(px(5.))
-                            .child(
-                                button("cancel-confirm", "取消", colors).on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.overlay = None;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
+                            .child(button("cancel-confirm", "取消", colors).on_click(
+                                cx.listener(|this, _, window, cx| this.cancel_overlay(window, cx)),
+                            ))
                             .child(
                                 button("apply-confirm", "确认", colors)
                                     .bg(colors.selected)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.apply_overlay(overlay, 0, cx)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.apply_overlay(overlay, 0, window, cx)
                                     })),
                             ),
                     )
@@ -1524,6 +1627,7 @@ fn target_icon(target: &Target) -> &'static str {
         Target::Clip(..) => "\u{e77f}",
         Target::Shortcut(_, ShortcutKind::Snippet) => "\u{e8a5}",
         Target::Shortcut(_, ShortcutKind::Quicklink) => "\u{e71b}",
+        Target::Note(_) => "\u{e70b}",
     }
 }
 

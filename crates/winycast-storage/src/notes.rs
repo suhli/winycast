@@ -13,8 +13,14 @@ impl Storage {
                     [id],
                     |row| {
                         Ok(Note {
-                            version: NoteVersion { id, revision: row.get(0)? },
-                            draft: NoteDraft { title: row.get(1)?, markdown: row.get(2)? },
+                            version: NoteVersion {
+                                id,
+                                revision: row.get(0)?,
+                            },
+                            draft: NoteDraft {
+                                title: row.get(1)?,
+                                markdown: row.get(2)?,
+                            },
                         })
                     },
                 )
@@ -35,7 +41,10 @@ impl Storage {
                     )
                     .optional()?
                     .context("笔记已被更改或删除，无法覆盖保存")?;
-                Ok(NoteVersion { revision, ..version })
+                Ok(NoteVersion {
+                    revision,
+                    ..version
+                })
             } else {
                 let id = connection.query_row(
                     "INSERT INTO notes (title, markdown) VALUES (?1, ?2) RETURNING id",
@@ -79,11 +88,19 @@ impl Storage {
                 let matched = markdown.is_some_and(|markdown| {
                     let body = markdown.to_lowercase();
                     let title = title.to_lowercase();
-                    terms.iter().all(|term| body.contains(term) || title.contains(term))
+                    terms
+                        .iter()
+                        .all(|term| body.contains(term) || title.contains(term))
                 });
                 entries.push(
-                    Entry::new(note_entry_id(id), title, excerpt, "Markdown 笔记", Target::Note(id))
-                        .with_content_match(matched),
+                    Entry::new(
+                        note_entry_id(id),
+                        title,
+                        excerpt,
+                        "Markdown 笔记",
+                        Target::Note(id),
+                    )
+                    .with_content_match(matched),
                 );
             }
             Ok(entries)
@@ -110,9 +127,16 @@ mod tests {
         assert_eq!(storage.note(note.version.id)?, Some(note.clone()));
         let revised = storage.save_note(
             Some(note.version),
-            NoteDraft { markdown: "修订".into(), ..draft.clone() },
+            NoteDraft {
+                markdown: "修订".into(),
+                ..draft.clone()
+            },
         )?;
-        assert!(storage.save_note(Some(note.version), draft.clone()).is_err());
+        assert!(
+            storage
+                .save_note(Some(note.version), draft.clone())
+                .is_err()
+        );
         assert_eq!(storage.note(note.version.id)?, Some(revised.clone()));
         storage.delete_note(note.version.id)?;
         assert!(storage.save_note(Some(revised.version), draft).is_err());

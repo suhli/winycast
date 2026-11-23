@@ -128,13 +128,31 @@ mod tests {
             (Page::Notes, "项目 mixedcase"),
         ] {
             let results = service.search(page, query.into(), cancel.clone()).await?;
-            assert!(results.iter().any(|row| row.entry.target == target), "{query}");
+            assert!(
+                results.iter().any(|row| row.entry.target == target),
+                "{query}"
+            );
         }
-        assert!(service.search(Page::Notes, "不存在".into(), cancel.clone()).await?.is_empty());
+        assert!(
+            service
+                .search(Page::Notes, "不存在".into(), cancel.clone())
+                .await?
+                .is_empty()
+        );
         cancel.cancel();
-        assert!(service.search(Page::Notes, "项目".into(), cancel).await?.is_empty());
+        assert!(
+            service
+                .search(Page::Notes, "项目".into(), cancel)
+                .await?
+                .is_empty()
+        );
         storage.delete_note(note.version.id)?;
-        assert!(service.search(Page::Notes, String::new(), CancellationToken::new()).await?.is_empty());
+        assert!(
+            service
+                .search(Page::Notes, String::new(), CancellationToken::new())
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 }

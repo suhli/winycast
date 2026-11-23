@@ -13,7 +13,8 @@ pub struct NoteDraft {
 impl NoteDraft {
     pub fn validated(mut self) -> Result<Self, &'static str> {
         self.title = self.title.trim().to_owned();
-        if self.title.is_empty() || self.title.len() > 256 || self.title.contains(char::is_control) {
+        if self.title.is_empty() || self.title.len() > 256 || self.title.contains(char::is_control)
+        {
             return Err("请输入有效标题（最多 256 字节）");
         }
         if self.markdown.len() > MARKDOWN_LIMIT || self.markdown.contains('\0') {
@@ -131,7 +132,13 @@ impl PreviewBuilder {
                     self.append("• ", false);
                 }
             }
-            Event::End(TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::HtmlBlock) => self.flush(),
+            Event::End(
+                TagEnd::Heading(_)
+                | TagEnd::Paragraph
+                | TagEnd::Item
+                | TagEnd::CodeBlock
+                | TagEnd::HtmlBlock,
+            ) => self.flush(),
             Event::Start(Tag::Strong) => self.strong += 1,
             Event::End(TagEnd::Strong) => self.strong = self.strong.saturating_sub(1),
             Event::Start(Tag::Emphasis) => self.emphasis += 1,
@@ -140,7 +147,9 @@ impl PreviewBuilder {
             Event::End(TagEnd::Strikethrough) => self.strike = self.strike.saturating_sub(1),
             Event::Start(Tag::Link { .. }) => self.links += 1,
             Event::End(TagEnd::Link) => self.links = self.links.saturating_sub(1),
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => self.append(&text, false),
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                self.append(&text, false)
+            }
             Event::Code(text) => self.append(&text, true),
             Event::SoftBreak => self.append(" ", false),
             Event::HardBreak => self.append("\n", false),
@@ -173,10 +182,15 @@ impl PreviewBuilder {
             code: code || self.block.kind == MarkdownBlockKind::Code,
         };
         self.block.text.push_str(text);
-        if let Some(last) = self.block.spans.last_mut() && last.style == style {
+        if let Some(last) = self.block.spans.last_mut()
+            && last.style == style
+        {
             last.len += text.len();
         } else {
-            self.block.spans.push(MarkdownSpan { len: text.len(), style });
+            self.block.spans.push(MarkdownSpan {
+                len: text.len(),
+                style,
+            });
         }
     }
 
@@ -194,7 +208,9 @@ mod tests {
 
     #[test]
     fn renders_sections_and_preserves_utf8_run_boundaries() {
-        let blocks = markdown_preview("# 标题\n\n> **加粗**与`代码`\n\n3. 已有条目\n\n```rust\nlet x = 1;\n```\n\n---");
+        let blocks = markdown_preview(
+            "# 标题\n\n> **加粗**与`代码`\n\n3. 已有条目\n\n```rust\nlet x = 1;\n```\n\n---",
+        );
         assert_eq!(blocks[0].kind, MarkdownBlockKind::Heading(1));
         assert_eq!(blocks[0].text, "标题");
         assert!(blocks[1].quoted);
