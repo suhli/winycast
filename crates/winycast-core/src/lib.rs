@@ -1,10 +1,12 @@
 mod calculator;
 mod search;
+mod shortcut;
 
 use serde::{Deserialize, Serialize};
 
 pub use calculator::calculate;
 pub use search::{Entry, Usage, rank};
+pub use shortcut::{Shortcut, ShortcutDraft, ShortcutKind, shortcut_entry_id};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Page {
@@ -13,6 +15,7 @@ pub enum Page {
     Windows,
     Clipboard,
     Files,
+    Shortcuts,
     Settings,
 }
 
@@ -58,6 +61,12 @@ pub fn commands() -> Vec<Entry> {
             Page(crate::Page::Files),
         ),
         (
+            "shortcuts",
+            "常用文本与链接",
+            "Snippets Quicklinks Shortcuts 常用项",
+            Page(crate::Page::Shortcuts),
+        ),
+        (
             "windows-settings",
             "打开 Windows 设置",
             "Windows Settings",
@@ -98,6 +107,7 @@ pub enum Target {
     Command(Command),
     CopyText(String),
     Clip(i64),
+    Shortcut(i64, ShortcutKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

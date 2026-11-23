@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -21,6 +22,15 @@ pub struct SearchInput {
     muted: Hsla,
     accent: Hsla,
     dragging: bool,
+    layout: InputLayout,
+}
+
+struct InputLayout {
+    font_size: f32,
+    line_height: f32,
+    rows: usize,
+    limit: usize,
+    grow: bool,
 }
 
 struct Composition {
@@ -29,10 +39,15 @@ struct Composition {
 }
 
 struct Geometry {
-    line: ShapedLine,
+    lines: Vec<VisibleLine>,
     bounds: Bounds<Pixels>,
+    line_height: Pixels,
+}
+
+struct VisibleLine {
+    line: ShapedLine,
+    range: Range<usize>,
     offset: Pixels,
-    text_is_empty: bool,
 }
 
 impl SearchInput {
@@ -50,7 +65,44 @@ impl SearchInput {
             muted: rgb(0x9ca7b6).into(),
             accent: rgb(0x62dccc).into(),
             dragging: false,
+            layout: InputLayout {
+                font_size: 22.,
+                line_height: 34.,
+                rows: 1,
+                limit: 8192,
+                grow: true,
+            },
         }
+    }
+
+    pub fn shortcut_field(
+        intents: async_channel::Sender<Intent>,
+        multiline: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut input = Self::new(intents, cx);
+        input.layout = if multiline {
+            InputLayout {
+                font_size: 16.,
+                line_height: 25.,
+                rows: 5,
+                limit: 8192,
+                grow: false,
+            }
+        } else {
+            InputLayout {
+                font_size: 16.,
+                line_height: 34.,
+                rows: 1,
+                limit: 256,
+                grow: false,
+            }
+        };
+        input
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     pub fn composing(&self) -> bool {
@@ -118,15 +170,21 @@ impl SearchInput {
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
-        let single_line = text.replace(['\r', '\n', '\t'], " ");
-        let end = single_line.floor_char_boundary(
-            single_line
-                .len()
-                .min(8192 - (self.text.len() - range.len()).min(8192)),
+        let insertion = if self.layout.rows > 1 {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.replace(['\r', '\n', '\t'], " ")
+        };
+        let end = insertion.floor_char_boundary(
+            insertion.len().min(
+                self.layout
+                    .limit
+                    .saturating_sub(self.text.len() - range.len()),
+            ),
         );
         self.caret = range.start + end;
         self.anchor = self.caret;
-        self.text.replace_range(range, &single_line[..end]);
+        self.text.replace_range(range, &insertion[..end]);
         self.composition = None;
         cx.emit(QueryChanged(self.text.clone()));
         cx.notify();
@@ -155,7 +213,9 @@ impl SearchInput {
                 }
             }
             "v" if mods.control => {
-                let _ = self.intents.try_send(Intent::PasteInput);
+                let _ = self
+                    .intents
+                    .try_send(Intent::PasteInput(self.focus.clone()));
             }
             "left" if !mods.alt => {
                 let p = if !mods.shift && !selection.is_empty() {
@@ -173,8 +233,16 @@ impl SearchInput {
                 };
                 self.set_caret(p, mods.shift, cx);
             }
-            "home" => self.set_caret(0, mods.shift, cx),
-            "end" => self.set_caret(self.text.len(), mods.shift, cx),
+            "home" if mods.control => self.set_caret(0, mods.shift, cx),
+            "end" if mods.control => self.set_caret(self.text.len(), mods.shift, cx),
+            "home" => self.set_caret(self.line_range().start, mods.shift, cx),
+            "end" => self.set_caret(self.line_range().end, mods.shift, cx),
+            "up" | "down" if self.layout.rows > 1 && !mods.control && !mods.alt => {
+                self.set_caret(self.adjacent_line(key == "up"), mods.shift, cx);
+            }
+            "enter" if self.layout.rows > 1 && !mods.control && !mods.alt && !mods.platform => {
+                self.replace(selection, "\n", cx);
+            }
             "backspace" | "delete" => {
                 let range = if !selection.is_empty() {
                     selection
@@ -194,11 +262,132 @@ impl SearchInput {
 
     fn mouse_index(&self, point: Point<Pixels>) -> Option<usize> {
         let geometry = self.geometry.as_ref()?;
-        if geometry.text_is_empty {
-            return Some(0);
+        let row = ((point.y - geometry.bounds.top()) / geometry.line_height) as usize;
+        let line = &geometry.lines[row.min(geometry.lines.len() - 1)];
+        let x = point.x - geometry.bounds.left() + line.offset;
+        let index = line.range.start + line.line.closest_index_for_x(x).min(line.range.len());
+        Some(self.text.floor_char_boundary(index.min(self.text.len())))
+    }
+
+    fn line_range(&self) -> Range<usize> {
+        let start = self.text[..self.caret].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.text[self.caret..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.caret + i);
+        start..end
+    }
+
+    fn adjacent_line(&self, previous: bool) -> usize {
+        let line = self.line_range();
+        let target = if previous {
+            if line.start == 0 {
+                return self.caret;
+            }
+            let end = line.start - 1;
+            let start = self.text[..end].rfind('\n').map_or(0, |i| i + 1);
+            start..end
+        } else {
+            if line.end == self.text.len() {
+                return self.caret;
+            }
+            let start = line.end + 1;
+            let end = self.text[start..]
+                .find('\n')
+                .map_or(self.text.len(), |i| start + i);
+            start..end
+        };
+        let column = self.text[line.start..self.caret].graphemes(true).count();
+        self.text[target.clone()]
+            .grapheme_indices(true)
+            .nth(column)
+            .map_or(target.end, |(index, _)| target.start + index)
+    }
+
+    fn shape_visible_lines(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Geometry {
+        let mut start = 0;
+        let ranges: Vec<_> = self
+            .text
+            .split('\n')
+            .map(|line| {
+                let range = start..start + line.len();
+                start = range.end + 1;
+                range
+            })
+            .collect();
+        let active = ranges.partition_point(|line| line.end < self.caret);
+        let top = if active >= self.layout.rows {
+            active + 1 - self.layout.rows
+        } else {
+            0
+        };
+        let empty = self.text.is_empty();
+        let lines = ranges
+            .into_iter()
+            .skip(top)
+            .take(self.layout.rows)
+            .map(|range| {
+                let raw: SharedString = if empty {
+                    self.placeholder.clone()
+                } else {
+                    self.text[range.clone()].replace('\t', " ").into()
+                };
+                let run = TextRun {
+                    len: raw.len(),
+                    font: font("Segoe UI"),
+                    color: if empty { self.muted } else { self.foreground },
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = if let Some(mark) = &self.composition {
+                    let start = mark.range.start.clamp(range.start, range.end) - range.start;
+                    let end = mark.range.end.clamp(range.start, range.end) - range.start;
+                    let runs = [
+                        TextRun {
+                            len: start,
+                            ..run.clone()
+                        },
+                        TextRun {
+                            len: end - start,
+                            underline: Some(UnderlineStyle {
+                                color: Some(self.accent),
+                                thickness: px(1.),
+                                wavy: false,
+                            }),
+                            ..run.clone()
+                        },
+                        TextRun {
+                            len: raw.len() - end,
+                            ..run
+                        },
+                    ];
+                    let runs: Vec<_> = runs.into_iter().filter(|run| run.len > 0).collect();
+                    window
+                        .text_system()
+                        .shape_line(raw, px(self.layout.font_size), &runs, None)
+                } else {
+                    window
+                        .text_system()
+                        .shape_line(raw, px(self.layout.font_size), &[run], None)
+                };
+                let offset = if (range.start..=range.end).contains(&self.caret) {
+                    (line.x_for_index(self.caret - range.start) - bounds.size.width + px(3.))
+                        .max(px(0.))
+                } else {
+                    px(0.)
+                };
+                VisibleLine {
+                    line,
+                    range,
+                    offset,
+                }
+            })
+            .collect();
+        Geometry {
+            lines,
+            bounds,
+            line_height: px(self.layout.line_height),
         }
-        let x = point.x - geometry.bounds.left() + geometry.offset;
-        Some(geometry.line.closest_index_for_x(x).min(self.text.len()))
     }
 }
 
@@ -334,18 +523,27 @@ impl EntityInputHandler for SearchInput {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry.as_ref()?;
-        let at = |i| {
-            geometry.bounds.left() - geometry.offset
-                + geometry.line.x_for_index(from_utf16(&self.text, i))
+        let start = from_utf16(&self.text, range.start);
+        let end = from_utf16(&self.text, range.end);
+        let (row, line) = geometry
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| start >= line.range.start && start <= line.range.end)?;
+        let at = |index: usize| {
+            geometry.bounds.left() - line.offset
+                + line
+                    .line
+                    .x_for_index(index.min(line.range.end) - line.range.start)
         };
-        let first = at(range.start);
-        let last = at(range.end);
+        let first = at(start);
+        let last = at(end);
         Some(Bounds::new(
-            point(first.min(last), geometry.bounds.top()),
-            size(
-                (last - first).abs().max(px(1.)),
-                geometry.bounds.size.height,
+            point(
+                first.min(last),
+                geometry.bounds.top() + geometry.line_height * row as f32,
             ),
+            size((last - first).abs().max(px(1.)), geometry.line_height),
         ))
     }
 
@@ -363,9 +561,10 @@ impl Render for SearchInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         div()
-            .flex_1()
+            .when(self.layout.grow, |input| input.flex_1())
+            .when(!self.layout.grow, |input| input.w_full().flex_shrink_0())
             .min_w_0()
-            .h(px(34.))
+            .h(px(self.layout.line_height * self.layout.rows as f32))
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .overflow_hidden()
@@ -403,88 +602,53 @@ impl Render for SearchInput {
                     move |bounds, _, window, cx| {
                         let input = view.read(cx);
                         let focus = input.focus.clone();
-                        let empty = input.text.is_empty();
-                        let raw = if empty {
-                            input.placeholder.clone()
-                        } else {
-                            input.text.clone().into()
-                        };
-                        let run = TextRun {
-                            len: raw.len(),
-                            font: font("Segoe UI"),
-                            color: if empty { input.muted } else { input.foreground },
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let runs = if let Some(mark) = &input.composition {
-                            [
-                                TextRun {
-                                    len: mark.range.start,
-                                    ..run.clone()
-                                },
-                                TextRun {
-                                    len: mark.range.len(),
-                                    underline: Some(UnderlineStyle {
-                                        color: Some(input.accent),
-                                        thickness: px(1.),
-                                        wavy: false,
-                                    }),
-                                    ..run.clone()
-                                },
-                                TextRun {
-                                    len: raw.len() - mark.range.end,
-                                    ..run
-                                },
-                            ]
-                            .into_iter()
-                            .filter(|run| run.len > 0)
-                            .collect::<Vec<_>>()
-                        } else {
-                            vec![run]
-                        };
-                        let line = window.text_system().shape_line(raw, px(22.), &runs, None);
-                        let x = line.x_for_index(input.caret);
-                        let offset = (x - bounds.size.width + px(3.)).max(px(0.));
-                        let origin = point(bounds.left() - offset, bounds.top());
+                        let geometry = input.shape_visible_lines(bounds, window);
                         let selection = input.selection();
                         let accent = input.accent;
+                        let caret = input.caret;
                         window.handle_input(
                             &focus,
                             ElementInputHandler::new(bounds, view.clone()),
                             cx,
                         );
-                        if !selection.is_empty() {
-                            let a = line.x_for_index(selection.start);
-                            let b = line.x_for_index(selection.end);
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(origin.x + a.min(b), origin.y + px(3.)),
-                                    size((b - a).abs(), px(28.)),
-                                ),
-                                accent.opacity(0.25),
-                            ));
-                        }
-                        let _ = line.paint(origin, bounds.size.height, window, cx);
-                        if focus.is_focused(window)
+                        let show_caret = focus.is_focused(window)
                             && selection.is_empty()
-                            && window.is_window_active()
-                        {
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(origin.x + x, origin.y + px(5.)),
-                                    size(px(1.5), px(24.)),
-                                ),
-                                accent,
-                            ));
+                            && window.is_window_active();
+                        let height = geometry.line_height;
+                        for (row, visible) in geometry.lines.iter().enumerate() {
+                            let origin = point(
+                                bounds.left() - visible.offset,
+                                bounds.top() + height * row as f32,
+                            );
+                            let range = &visible.range;
+                            let line = &visible.line;
+                            let start = selection.start.max(range.start);
+                            let end = selection.end.min(range.end);
+                            if start < end {
+                                let a = line.x_for_index(start - range.start);
+                                let b = line.x_for_index(end - range.start);
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(origin.x + a.min(b), origin.y + px(3.)),
+                                        size((b - a).abs(), height - px(6.)),
+                                    ),
+                                    accent.opacity(0.25),
+                                ));
+                            }
+                            let _ = line.paint(origin, height, window, cx);
+                            if show_caret && (range.start..=range.end).contains(&caret) {
+                                let x = line.x_for_index(caret - range.start);
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(origin.x + x, origin.y + px(5.)),
+                                        size(px(1.5), height - px(10.)),
+                                    ),
+                                    accent,
+                                ));
+                            }
                         }
                         view.update(cx, |input, _| {
-                            input.geometry = Some(Geometry {
-                                line,
-                                bounds,
-                                offset,
-                                text_is_empty: empty,
-                            })
+                            input.geometry = Some(geometry);
                         });
                     },
                 )

@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -8,11 +9,11 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_channel::Sender;
-use gpui::{Context, Image, ImageFormat, Window};
+use gpui::{Context, FocusHandle, Image, ImageFormat, Window};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use winycast_core::{ClipboardData, Command, Page, Row, Settings, Target};
+use winycast_core::{ClipboardData, Command, Page, Row, Settings, Shortcut, ShortcutKind, Target};
 use winycast_platform_windows::{self as native, DesktopEvent, DesktopHost, Panel};
 use winycast_providers::{SearchService, index_clipboard_images};
 use winycast_storage::{Storage, unix_time};
@@ -37,7 +38,9 @@ pub(crate) enum WorkerEvent {
     ClipboardChanged(Result<ClipboardChange>),
     ClipboardCleared(Result<()>),
     ClipboardOcr(CancellationToken, Result<usize>),
-    Paste(u64, Result<Option<String>>),
+    Paste(u64, FocusHandle, Result<Option<String>>),
+    ShortcutLoaded(u64, Result<Shortcut>),
+    ShortcutSaved(u64, Result<i64>),
     Hide(u64),
     Resize(u64, i32),
     Expire,
@@ -193,9 +196,33 @@ impl Controller {
                 Intent::ClearClipboard => self.clear_clipboard(),
                 Intent::Resize(compact) => self.resize(compact),
                 Intent::CopyInput(text) => self.copy(ClipboardData::Text(text), None, false),
-                Intent::PasteInput => {
+                Intent::PasteInput(focus) => {
                     let seq = self.visibility_seq;
-                    self.background(move || WorkerEvent::Paste(seq, native::read_text()));
+                    self.background(move || WorkerEvent::Paste(seq, focus, native::read_text()));
+                }
+                Intent::LoadShortcut { request, id } => {
+                    let storage = self.storage.clone();
+                    self.background(move || {
+                        WorkerEvent::ShortcutLoaded(
+                            request,
+                            storage.shortcut(id).and_then(|shortcut| {
+                                shortcut.ok_or_else(|| anyhow!("常用项已移除"))
+                            }),
+                        )
+                    });
+                }
+                Intent::SaveShortcut { request, id, draft } => {
+                    let storage = self.storage.clone();
+                    self.background(move || {
+                        WorkerEvent::ShortcutSaved(request, storage.save_shortcut(id, draft))
+                    });
+                }
+                Intent::DeleteShortcut(id) => {
+                    let storage = self.storage.clone();
+                    self.background(move || WorkerEvent::Refresh {
+                        result: storage.delete_shortcut(id),
+                        message: Some("已删除常用项"),
+                    });
                 }
             },
             Event::Worker(event) => match event {
@@ -326,14 +353,30 @@ impl Controller {
                         Err(error) => ui.toast(format!("清空失败：{error}"), window, cx),
                     }
                 }
-                WorkerEvent::Paste(seq, result)
+                WorkerEvent::Paste(seq, focus, result)
                     if seq == self.visibility_seq && self.panel.active() =>
                 {
                     match result {
-                        Ok(Some(text)) => ui.paste_input(text, cx),
+                        Ok(Some(text)) => ui.paste_input(&focus, text, window, cx),
                         Ok(None) => {}
                         Err(error) => ui.toast(format!("无法读取剪贴板：{error}"), window, cx),
                     }
+                }
+                WorkerEvent::ShortcutLoaded(request, result) if self.panel.active() => {
+                    ui.shortcut_loaded(
+                        request,
+                        result.map_err(|error| error.to_string()),
+                        window,
+                        cx,
+                    );
+                }
+                WorkerEvent::ShortcutSaved(request, result) => {
+                    ui.shortcut_saved(
+                        request,
+                        result.map_err(|error| error.to_string()),
+                        window,
+                        cx,
+                    );
                 }
                 WorkerEvent::Hide(seq) if seq == self.visibility_seq && self.closing => {
                     self.hide_now(true, ui, cx)
@@ -662,6 +705,33 @@ impl Controller {
             Target::CopyText(text) => {
                 self.copy(ClipboardData::Text(text), Some("计算结果已复制"), false)
             }
+            Target::Shortcut(shortcut, kind) => {
+                let storage = self.storage.clone();
+                let writer = self.host.clipboard_writer();
+                self.background(move || {
+                    let result = (|| {
+                        let draft = storage
+                            .shortcut(shortcut)?
+                            .ok_or_else(|| anyhow!("常用项已移除"))?
+                            .draft;
+                        anyhow::ensure!(draft.kind == kind, "常用项类型已更改，请重新选择");
+                        let draft = draft.validated().map_err(|message| anyhow!(message))?;
+                        match kind {
+                            ShortcutKind::Snippet => {
+                                writer.write(ClipboardData::Text(draft.body))?
+                            }
+                            ShortcutKind::Quicklink => native::launch(OsStr::new(&draft.body))?,
+                        }
+                        let _ = storage.record_shortcut_use(shortcut);
+                        Ok(())
+                    })();
+                    WorkerEvent::Completed(
+                        result,
+                        (kind == ShortcutKind::Snippet).then_some("已复制到剪贴板"),
+                        true,
+                    )
+                });
+            }
             Target::File(path) => self.background(move || {
                 WorkerEvent::Completed(native::launch(path.as_os_str()), None, true)
             }),
@@ -701,6 +771,7 @@ impl Controller {
         self.background(move || WorkerEvent::Refresh {
             result: match target {
                 Target::Clip(id) => storage.toggle_clip_pin(id),
+                Target::Shortcut(id, _) => storage.toggle_shortcut_favorite(id),
                 _ => storage.toggle_favorite(&id),
             },
             message: None,

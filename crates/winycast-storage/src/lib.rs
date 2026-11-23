@@ -1,3 +1,5 @@
+mod shortcuts;
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -51,6 +53,12 @@ impl Storage {
              CREATE TABLE IF NOT EXISTS clipboard_image_ocr (
                 clip_id INTEGER PRIMARY KEY REFERENCES clipboard(id) ON DELETE CASCADE,
                 search_text TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS shortcuts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind INTEGER NOT NULL CHECK(kind IN (0, 1)),
+                title TEXT NOT NULL,
+                body TEXT NOT NULL
              );",
         )?;
         Ok(Self(Arc::new(Mutex::new(connection))))

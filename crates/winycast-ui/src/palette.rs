@@ -3,19 +3,23 @@ use std::{sync::Arc, time::Duration};
 use async_channel::Sender;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use winycast_core::{Command, Hotkey, Page, Row, Settings, SystemCommand, Target, Theme};
+use winycast_core::{
+    Command, Hotkey, Page, Row, Settings, Shortcut, ShortcutKind, SystemCommand, Target, Theme,
+};
 
 use crate::{
     Intent, Preview,
     input::{QueryChanged, SearchInput},
     settings::SettingsWindow,
+    shortcuts::ShortcutEditor,
 };
 
-const SEARCH_TABS: [(&str, &str, Page); 4] = [
+const SEARCH_TABS: [(&str, &str, Page); 5] = [
     ("launcher-tab", "应用", Page::Launcher),
     ("windows-tab", "窗口", Page::Windows),
     ("clipboard-tab", "剪贴板", Page::Clipboard),
     ("files-tab", "文件", Page::Files),
+    ("shortcuts-tab", "常用", Page::Shortcuts),
 ];
 
 #[derive(Clone, Copy)]
@@ -73,6 +77,24 @@ enum Overlay {
     Actions,
     ConfirmSystem,
     ConfirmClear,
+    ConfirmDeleteShortcut(i64),
+}
+
+#[derive(Clone, Copy)]
+enum ResultAction {
+    Run,
+    Pin,
+    EditShortcut,
+    DeleteShortcut,
+}
+
+fn result_actions(target: &Target) -> &'static [ResultAction] {
+    use ResultAction::*;
+    match target {
+        Target::Shortcut(..) => &[Run, EditShortcut, Pin, DeleteShortcut],
+        _ if can_pin(target) => &[Run, Pin],
+        _ => &[Run],
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -114,6 +136,9 @@ pub struct CommandPalette {
     overlay: Option<Overlay>,
     menu_index: usize,
     preview: Option<(i64, Preview)>,
+    shortcut_request: u64,
+    loading_shortcut: Option<u64>,
+    shortcut_editor: Option<ShortcutEditor>,
     compact: bool,
     opening: usize,
     closing: bool,
@@ -157,6 +182,9 @@ impl CommandPalette {
             overlay: None,
             menu_index: 0,
             preview: None,
+            shortcut_request: 0,
+            loading_shortcut: None,
+            shortcut_editor: None,
             compact: false,
             opening: 0,
             closing: false,
@@ -173,13 +201,15 @@ impl CommandPalette {
         if let Some(page) = page {
             self.change_page(page, window, cx);
         }
-        self.focus(window);
+        self.focus(window, cx);
         self.request_search();
         cx.notify();
     }
 
-    fn focus(&self, window: &mut Window) {
-        if self.page == Page::Settings {
+    fn focus(&self, window: &mut Window, cx: &App) {
+        if let Some(editor) = &self.shortcut_editor {
+            editor.title.read(cx).focus.focus(window);
+        } else if self.page == Page::Settings {
             self.controls.focus(window);
         } else {
             self.input_focused.focus(window);
@@ -196,6 +226,7 @@ impl CommandPalette {
         self.closing = false;
         self.overlay = None;
         self.capturing_hotkey = false;
+        self.loading_shortcut = None;
         self.cancel_composition(cx);
         cx.notify();
     }
@@ -211,12 +242,32 @@ impl CommandPalette {
     pub fn cancel_composition(&mut self, cx: &mut Context<Self>) {
         self.input
             .update(cx, |input, cx| input.cancel_composition(cx));
+        if let Some(editor) = &self.shortcut_editor {
+            for field in editor.fields() {
+                field.update(cx, |field, cx| field.cancel_composition(cx));
+            }
+        }
     }
 
-    pub fn paste_input(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.page != Page::Settings && !self.closing {
-            self.input
-                .update(cx, |input, cx| input.paste_text(&text, cx));
+    pub fn paste_input(
+        &mut self,
+        focus: &FocusHandle,
+        text: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page == Page::Settings || self.closing || !focus.is_focused(window) {
+            return;
+        }
+        let field = match &self.shortcut_editor {
+            Some(editor) => editor
+                .fields()
+                .into_iter()
+                .find(|field| &field.read(cx).focus == focus),
+            None => (&self.input_focused == focus).then_some(&self.input),
+        };
+        if let Some(field) = field {
+            field.update(cx, |input, cx| input.paste_text(&text, cx));
         }
     }
 
@@ -308,7 +359,7 @@ impl CommandPalette {
     }
 
     fn request_search(&mut self) {
-        if self.page == Page::Settings {
+        if self.page == Page::Settings || self.shortcut_editor.is_some() {
             return;
         }
         self.list.pending = true;
@@ -339,6 +390,8 @@ impl CommandPalette {
             return;
         }
         self.cancel_composition(cx);
+        self.shortcut_editor = None;
+        self.loading_shortcut = None;
         self.page = page;
         self.query.clear();
         self.overlay = None;
@@ -350,10 +403,10 @@ impl CommandPalette {
         self.list.scroll = Default::default();
         self.input
             .update(cx, |input, cx| input.set_text(String::new(), cx));
-        if matches!(page, Page::Settings | Page::Files) && self.compact {
+        if matches!(page, Page::Settings | Page::Files | Page::Shortcuts) && self.compact {
             self.set_compact(false, cx);
         }
-        self.focus(window);
+        self.focus(window, cx);
         self.request_search();
         cx.notify();
     }
@@ -426,6 +479,10 @@ impl CommandPalette {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcut_editor.is_some() {
+            self.shortcut_editor_key(event, window, cx);
+            return;
+        }
         if self.input.read(cx).composing() || self.closing {
             return;
         }
@@ -460,11 +517,10 @@ impl CommandPalette {
             match key {
                 "escape" => self.overlay = None,
                 "up" | "down" if overlay == Overlay::Actions => {
-                    if self
-                        .selected()
-                        .is_some_and(|row| can_pin(&row.entry.target))
-                    {
-                        self.menu_index ^= 1;
+                    if let Some(row) = self.selected() {
+                        let count = result_actions(&row.entry.target).len();
+                        let offset = if key == "down" { 1 } else { count - 1 };
+                        self.menu_index = (self.menu_index + offset) % count;
                     }
                 }
                 "enter" => self.apply_overlay(overlay, self.menu_index, cx),
@@ -479,6 +535,9 @@ impl CommandPalette {
             "escape" => self.send(Intent::Hide),
             "," if modifiers.control => self.change_page(Page::Settings, window, cx),
             "f" if modifiers.control => self.change_page(Page::Files, window, cx),
+            "n" if modifiers.control && self.page == Page::Shortcuts => {
+                self.new_shortcut(window, cx);
+            }
             "up" | "down" if self.page == Page::Settings => {
                 self.settings_index = if key == "down" {
                     (self.settings_index + 1).min(SettingsWindow::ITEMS.len() - 1)
@@ -533,6 +592,172 @@ impl CommandPalette {
         cx.notify();
     }
 
+    fn shortcut_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &self.shortcut_editor else {
+            return;
+        };
+        if self.closing
+            || editor.saving()
+            || editor
+                .fields()
+                .iter()
+                .any(|field| field.read(cx).composing())
+        {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
+        match key {
+            "escape" => self.close_shortcut_editor(window, cx),
+            "enter" if mods.control && !event.is_held => self.save_shortcut(cx),
+            "tab" if mods.control => {
+                let next = match editor.kind {
+                    ShortcutKind::Snippet => ShortcutKind::Quicklink,
+                    ShortcutKind::Quicklink => ShortcutKind::Snippet,
+                };
+                self.set_shortcut_kind(next, cx);
+            }
+            "tab" => {
+                if editor.title.read(cx).focus.is_focused(window) {
+                    editor.body.read(cx).focus.focus(window);
+                } else {
+                    editor.title.read(cx).focus.focus(window);
+                }
+            }
+            "enter" if !event.is_held && editor.title.read(cx).focus.is_focused(window) => {
+                editor.body.read(cx).focus.focus(window);
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn new_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_request = self.shortcut_request.wrapping_add(1);
+        self.open_shortcut_editor(self.shortcut_request, None, window, cx);
+    }
+
+    fn open_shortcut_editor(
+        &mut self,
+        request: u64,
+        shortcut: Option<Shortcut>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.change_page(Page::Shortcuts, window, cx);
+        self.cancel_composition(cx);
+        self.set_compact(false, cx);
+        self.overlay = None;
+        self.loading_shortcut = None;
+        self.shortcut_editor = Some(ShortcutEditor::new(request, shortcut, &self.intents, cx));
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn shortcut_loaded(
+        &mut self,
+        request: u64,
+        result: Result<Shortcut, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.loading_shortcut != Some(request) {
+            return;
+        }
+        self.loading_shortcut = None;
+        match result {
+            Ok(shortcut) => self.open_shortcut_editor(request, Some(shortcut), window, cx),
+            Err(error) => self.toast(error, window, cx),
+        }
+    }
+
+    pub(crate) fn set_shortcut_kind(&mut self, kind: ShortcutKind, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.shortcut_editor
+            && !editor.saving()
+        {
+            editor.kind = kind;
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn save_shortcut(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.shortcut_editor else {
+            return;
+        };
+        if editor.saving()
+            || editor
+                .fields()
+                .iter()
+                .any(|field| field.read(cx).composing())
+        {
+            return;
+        }
+        let draft = editor.draft(cx);
+        let intent = Intent::SaveShortcut {
+            request: editor.request,
+            id: editor.id,
+            draft: draft.clone(),
+        };
+        if self.intents.try_send(intent).is_ok() {
+            editor.pending = Some(draft);
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn close_shortcut_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .shortcut_editor
+            .as_ref()
+            .is_some_and(|editor| !editor.saving())
+        {
+            self.cancel_composition(cx);
+            self.shortcut_editor = None;
+            self.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn shortcut_saved(
+        &mut self,
+        request: u64,
+        result: Result<i64, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = &mut self.shortcut_editor
+            && editor.request == request
+        {
+            let submitted = editor.pending.take();
+            match &result {
+                Ok(id) => {
+                    editor.id = Some(*id);
+                    if submitted.is_some_and(|draft| draft != editor.draft(cx)) {
+                        self.toast("已保存，表单还有未保存的改动", window, cx);
+                        return;
+                    }
+                }
+                Err(error) => {
+                    editor.error = Some(error.clone().into());
+                    cx.notify();
+                    return;
+                }
+            }
+            self.close_shortcut_editor(window, cx);
+        }
+        if result.is_ok() {
+            self.refresh(cx);
+            self.toast("已保存", window, cx);
+        }
+    }
+
     fn open_actions(&mut self, cx: &mut Context<Self>) {
         if self.selected().is_some() && !self.list.pending {
             self.set_compact(false, cx);
@@ -544,14 +769,41 @@ impl CommandPalette {
 
     fn apply_overlay(&mut self, overlay: Overlay, index: usize, cx: &mut Context<Self>) {
         match overlay {
-            Overlay::Actions if index == 0 => self.run_selected(false, cx),
-            Overlay::Actions => self.toggle_pin(cx),
+            Overlay::Actions => {
+                let Some(row) = self.selected().filter(|_| !self.list.pending) else {
+                    return;
+                };
+                let target = &row.entry.target;
+                match (result_actions(target).get(index), target) {
+                    (Some(ResultAction::Run), _) => self.run_selected(false, cx),
+                    (Some(ResultAction::Pin), _) => self.toggle_pin(cx),
+                    (Some(ResultAction::EditShortcut), Target::Shortcut(id, _)) => {
+                        let id = *id;
+                        self.overlay = None;
+                        self.shortcut_request = self.shortcut_request.wrapping_add(1);
+                        self.loading_shortcut = Some(self.shortcut_request);
+                        self.send(Intent::LoadShortcut {
+                            request: self.shortcut_request,
+                            id,
+                        });
+                    }
+                    (Some(ResultAction::DeleteShortcut), Target::Shortcut(id, _)) => {
+                        self.overlay = Some(Overlay::ConfirmDeleteShortcut(*id));
+                    }
+                    _ => {}
+                }
+            }
             Overlay::ConfirmSystem => self.run_selected(true, cx),
             Overlay::ConfirmClear => {
                 self.overlay = None;
                 self.send(Intent::ClearClipboard);
             }
+            Overlay::ConfirmDeleteShortcut(id) => {
+                self.overlay = None;
+                self.send(Intent::DeleteShortcut(id));
+            }
         }
+        cx.notify();
     }
 
     fn save_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
@@ -609,7 +861,7 @@ fn next_item<T: Copy + PartialEq>(list: &[T], current: T, step: i32) -> T {
 fn can_pin(target: &Target) -> bool {
     matches!(
         target,
-        Target::App(_) | Target::Command(_) | Target::Clip(_)
+        Target::App(_) | Target::Command(_) | Target::Clip(_) | Target::Shortcut(..)
     )
 }
 
@@ -624,11 +876,22 @@ impl Render for CommandPalette {
             }
             Page::Clipboard => ("搜索剪贴板文字或图片…", "\u{e77f}"),
             Page::Files => ("搜索 Windows 已索引的文件…", "\u{e8b7}"),
+            Page::Shortcuts => ("搜索常用文本和快捷链接…", "\u{e734}"),
             Page::Settings => ("", "\u{e713}"),
         };
         self.input.update(cx, |input, _| {
             input.style(placeholder, colors.text, colors.muted, colors.accent)
         });
+        let editor = self.shortcut_editor.as_ref();
+        let heading = editor
+            .map(|editor| {
+                if editor.id.is_some() {
+                    "编辑常用项"
+                } else {
+                    "新建常用项"
+                }
+            })
+            .or((self.page == Page::Settings).then_some("Winycast 设置"));
         let search = div()
             .h(px(62.))
             .flex_shrink_0()
@@ -639,16 +902,30 @@ impl Render for CommandPalette {
             .border_b_1()
             .border_color(colors.line)
             .child(glyph(icon, colors.accent, 20.))
-            .child(if self.page == Page::Settings {
+            .child(if let Some(heading) = heading {
                 div()
                     .flex_1()
                     .text_size(px(21.))
-                    .child("Winycast 设置")
+                    .child(heading)
                     .into_any_element()
             } else {
                 self.input.clone().into_any_element()
             })
-            .child(if self.page == Page::Settings {
+            .when(editor.is_none() && self.page == Page::Shortcuts, |header| {
+                header.child(
+                    button("new-shortcut", "新建", colors)
+                        .bg(colors.selected)
+                        .text_color(colors.accent)
+                        .on_click(cx.listener(|this, _, window, cx| this.new_shortcut(window, cx))),
+                )
+            })
+            .child(if editor.is_some() {
+                button("cancel-shortcut", "取消", colors)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close_shortcut_editor(window, cx)),
+                    )
+                    .into_any_element()
+            } else if self.page == Page::Settings {
                 button("back-to-search", "返回", colors)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.change_page(Page::Launcher, window, cx);
@@ -663,8 +940,9 @@ impl Render for CommandPalette {
                 .on_click(cx.listener(|this, _, _, cx| this.set_compact(!this.compact, cx)))
                 .into_any_element()
             });
-        let body = match self.page {
-            Page::Settings => SettingsWindow::render(
+        let body = match (editor, self.page) {
+            (Some(editor), _) => editor.render(colors, cx),
+            (None, Page::Settings) => SettingsWindow::render(
                 &self.settings,
                 self.settings_index,
                 &self.settings_scroll,
@@ -752,6 +1030,8 @@ impl CommandPalette {
                 "剪贴板记录已暂停。可在设置中开启。"
             } else if self.page == Page::Clipboard && self.query.is_empty() {
                 "尚无剪贴板记录"
+            } else if self.page == Page::Shortcuts && self.query.is_empty() {
+                "按 Ctrl + N 新建常用文本或快捷链接"
             } else {
                 "没有找到匹配结果"
             };
@@ -819,6 +1099,28 @@ impl CommandPalette {
             .border_t_1()
             .border_color(colors.line)
             .text_size(px(12.));
+        if let Some(editor) = &self.shortcut_editor {
+            return footer
+                .child(
+                    div()
+                        .text_color(colors.muted)
+                        .child("Tab 切换输入框 · Ctrl + Tab 切换类型"),
+                )
+                .child(
+                    button(
+                        "save-shortcut",
+                        if editor.saving() {
+                            "正在保存…"
+                        } else {
+                            "保存  Ctrl ↵"
+                        },
+                        colors,
+                    )
+                    .bg(colors.selected)
+                    .text_color(colors.accent)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_shortcut(cx))),
+                );
+        }
         if self.page == Page::Settings {
             return footer.child(
                 div()
@@ -857,10 +1159,11 @@ impl CommandPalette {
                 .child(
                     button(
                         "execute",
-                        if self.page == Page::Files {
-                            "打开  ↵"
-                        } else {
-                            "运行  ↵"
+                        match self.selected().map(|row| &row.entry.target) {
+                            Some(Target::Shortcut(_, ShortcutKind::Snippet)) => "复制  ↵",
+                            Some(Target::Shortcut(_, ShortcutKind::Quicklink)) => "打开  ↵",
+                            _ if self.page == Page::Files => "打开  ↵",
+                            _ => "运行  ↵",
                         },
                         colors,
                     )
@@ -884,6 +1187,8 @@ impl ResultItem {
         let icon = target_icon(&row.entry.target);
         let subtitle = if matches!(row.entry.target, Target::Clip(_)) {
             "剪贴板".into()
+        } else if let Target::Shortcut(_, kind) = row.entry.target {
+            kind.label().into()
         } else {
             row.entry.detail.clone()
         };
@@ -945,7 +1250,7 @@ impl ResultItem {
             })
             .on_click(move |event, window, cx| {
                 let _ = palette.update(cx, |palette, cx| {
-                    palette.focus(window);
+                    palette.focus(window, cx);
                     palette.select(index, cx);
                     if event.click_count() >= 2 {
                         palette.run_selected(false, cx);
@@ -965,6 +1270,7 @@ impl PreviewPanel {
             Target::Command(_) => "命令",
             Target::CopyText(_) => "计算结果",
             Target::Clip(_) => "剪贴板",
+            Target::Shortcut(_, kind) => kind.label(),
         };
         div()
             .w(px(200.))
@@ -1021,38 +1327,45 @@ impl ActionMenu {
     ) -> impl IntoElement {
         let dialog = match overlay {
             Overlay::Actions => {
-                let row = palette.selected();
-                let verb = match row.map(|row| &row.entry.target) {
-                    Some(Target::Clip(_) | Target::CopyText(_)) => "复制",
-                    Some(Target::File(_)) => "打开文件",
-                    _ => "运行",
-                };
                 let mut menu = div().flex().flex_col().gap(px(4.));
-                let pin = row.is_some_and(|row| row.pinned);
-                let label = if row.is_some_and(|row| matches!(row.entry.target, Target::Clip(_))) {
-                    if pin { "取消固定" } else { "固定条目" }
-                } else if pin {
-                    "取消收藏"
-                } else {
-                    "收藏"
-                };
-                for (index, label) in [verb, label].into_iter().enumerate() {
-                    if index == 1 && row.is_none_or(|row| !can_pin(&row.entry.target)) {
-                        continue;
+                if let Some(row) = palette.selected() {
+                    for (index, action) in result_actions(&row.entry.target).iter().enumerate() {
+                        let label = match action {
+                            ResultAction::Run => match row.entry.target {
+                                Target::Clip(_)
+                                | Target::CopyText(_)
+                                | Target::Shortcut(_, ShortcutKind::Snippet) => "复制",
+                                Target::File(_) => "打开文件",
+                                Target::Shortcut(_, ShortcutKind::Quicklink) => "在浏览器打开",
+                                _ => "运行",
+                            },
+                            ResultAction::Pin => {
+                                match (matches!(row.entry.target, Target::Clip(_)), row.pinned) {
+                                    (true, true) => "取消固定",
+                                    (true, false) => "固定条目",
+                                    (false, true) => "取消收藏",
+                                    (false, false) => "收藏",
+                                }
+                            }
+                            ResultAction::EditShortcut => "编辑",
+                            ResultAction::DeleteShortcut => "删除",
+                        };
+                        menu = menu.child(
+                            button(("entry-action", index), label, colors)
+                                .when(palette.menu_index == index, |item| item.bg(colors.selected))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.apply_overlay(overlay, index, cx)
+                                })),
+                        );
                     }
-                    menu = menu.child(
-                        button(("entry-action", index), label, colors)
-                            .when(palette.menu_index == index, |item| item.bg(colors.selected))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.apply_overlay(overlay, index, cx)
-                            })),
-                    );
                 }
                 menu
             }
-            Overlay::ConfirmSystem | Overlay::ConfirmClear => {
+            Overlay::ConfirmSystem | Overlay::ConfirmClear | Overlay::ConfirmDeleteShortcut(_) => {
                 let title = if overlay == Overlay::ConfirmClear {
                     "清空全部剪贴板历史？"
+                } else if matches!(overlay, Overlay::ConfirmDeleteShortcut(_)) {
+                    "删除这个常用项？"
                 } else if palette.selected().is_some_and(|row| {
                     row.entry.target == Target::Command(Command::System(SystemCommand::Sleep))
                 }) {
@@ -1132,6 +1445,8 @@ fn target_icon(target: &Target) -> &'static str {
         Target::Command(_) => "\u{e713}",
         Target::CopyText(_) => "\u{e8ef}",
         Target::Clip(_) => "\u{e77f}",
+        Target::Shortcut(_, ShortcutKind::Snippet) => "\u{e8a5}",
+        Target::Shortcut(_, ShortcutKind::Quicklink) => "\u{e71b}",
     }
 }
 

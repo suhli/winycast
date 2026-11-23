@@ -18,6 +18,63 @@ pub struct SearchService {
     file_query_slot: Arc<Mutex<()>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use winycast_core::{ShortcutDraft, ShortcutKind};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn searches_saved_shortcuts_in_both_views() -> Result<()> {
+        let storage = Storage::open(Path::new(":memory:"))?;
+        let snippet = storage.save_shortcut(
+            None,
+            ShortcutDraft {
+                kind: ShortcutKind::Snippet,
+                title: "会议纪要".into(),
+                body: "议题\n结论".into(),
+            },
+        )?;
+        let link = storage.save_shortcut(
+            None,
+            ShortcutDraft {
+                kind: ShortcutKind::Quicklink,
+                title: "文档链接".into(),
+                body: "https://example.com/".into(),
+            },
+        )?;
+        let service = SearchService::new(storage);
+        let cancel = CancellationToken::new();
+        let rows = service
+            .search(Page::Launcher, String::new(), cancel.clone())
+            .await?;
+        for target in [
+            Target::Shortcut(snippet, ShortcutKind::Snippet),
+            Target::Shortcut(link, ShortcutKind::Quicklink),
+        ] {
+            assert!(rows.iter().any(|row| row.entry.target == target));
+        }
+        let rows = service
+            .search(Page::Shortcuts, "wdlj".into(), cancel.clone())
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entry.target,
+            Target::Shortcut(link, ShortcutKind::Quicklink)
+        );
+        cancel.cancel();
+        assert!(
+            service
+                .search(Page::Shortcuts, String::new(), cancel)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+}
+
 impl SearchService {
     pub fn new(storage: Storage) -> Self {
         Self {
@@ -90,6 +147,16 @@ impl SearchService {
         if page == Page::Clipboard {
             return self.storage.clips(query, || cancel.is_cancelled());
         }
+        let shortcuts = if matches!(page, Page::Launcher | Page::Shortcuts) {
+            self.storage.shortcuts(|| cancel.is_cancelled())?
+        } else {
+            Vec::new()
+        };
+        if page == Page::Shortcuts {
+            return Ok(rank(&shortcuts, query, &self.storage.usage()?, || {
+                cancel.is_cancelled()
+            }));
+        }
         if page == Page::Files {
             return Ok(
                 winycast_platform_windows::search_files(query, || cancel.is_cancelled())?
@@ -123,7 +190,10 @@ impl SearchService {
         let usage = self.storage.usage()?;
         let general = (page == Page::Launcher).then_some(self.commands.iter().chain(apps.iter()));
         let mut rows = rank(
-            windows.iter().chain(general.into_iter().flatten()),
+            windows
+                .iter()
+                .chain(general.into_iter().flatten())
+                .chain(&shortcuts),
             query,
             &usage,
             || cancel.is_cancelled(),
