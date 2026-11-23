@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_channel::Sender;
-use gpui::{Context, FocusHandle, Image, ImageFormat, Window};
+use gpui::{AsyncApp, Context, FocusHandle, Image, ImageFormat, Window, WindowHandle};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -148,41 +148,71 @@ impl Controller {
     pub(crate) fn handle(
         &mut self,
         event: Event,
+        window: WindowHandle<CommandPalette>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        if self.trace
+            && let Event::Desktop(event) = &event
+            && !matches!(event, DesktopEvent::Clipboard(_))
+        {
+            eprintln!("desktop: {event:?}");
+        }
+
+        // SetWindowPos sends WM_SIZE synchronously. GPUI's resize callback must
+        // be able to borrow the App and update its viewport when that happens.
+        let resized = match event {
+            Event::Desktop(DesktopEvent::Toggle)
+                if self.panel.visible() && self.panel.active() && !self.closing =>
+            {
+                return window.update(cx, |ui, _, cx| self.hide(ui, cx));
+            }
+            Event::Desktop(DesktopEvent::Toggle | DesktopEvent::Show) => {
+                return self.show(None, window, cx);
+            }
+            Event::Desktop(DesktopEvent::Settings) => {
+                return self.show(Some(Page::Settings), window, cx);
+            }
+            Event::Ui(Intent::Resize(compact)) => self.resize(compact),
+            Event::Worker(WorkerEvent::Resize(seq, height)) => {
+                if seq != self.resize_seq || !self.panel.visible() {
+                    return Ok(());
+                }
+                self.panel.resize(height)
+            }
+            event => return window.update(cx, |ui, window, cx| self.update(event, ui, window, cx)),
+        };
+        if let Err(error) = resized {
+            window.update(cx, |ui, window, cx| {
+                ui.toast(format!("调整面板失败：{error}"), window, cx);
+            })?;
+        }
+        Ok(())
+    }
+
+    fn update(
+        &mut self,
+        event: Event,
         ui: &mut CommandPalette,
         window: &mut Window,
         cx: &mut Context<CommandPalette>,
     ) {
         match event {
-            Event::Desktop(event) => {
-                if self.trace && !matches!(event, DesktopEvent::Clipboard(_)) {
-                    eprintln!("desktop: {event:?}");
+            Event::Desktop(event) => match event {
+                DesktopEvent::Deactivated(id)
+                    if id == self.panel.id() && self.panel.visible() && !self.panel.active() =>
+                {
+                    self.hide_now(false, ui, cx);
                 }
-                match event {
-                    DesktopEvent::Toggle
-                        if self.panel.visible() && self.panel.active() && !self.closing =>
-                    {
-                        self.hide(ui, cx)
-                    }
-                    DesktopEvent::Show | DesktopEvent::Toggle => self.show(None, ui, window, cx),
-                    DesktopEvent::Settings => self.show(Some(Page::Settings), ui, window, cx),
-                    DesktopEvent::Deactivated(id)
-                        if id == self.panel.id()
-                            && self.panel.visible()
-                            && !self.panel.active() =>
-                    {
-                        self.hide_now(false, ui, cx);
-                    }
-                    DesktopEvent::CompositionEnded(id) if id == self.panel.id() => {
-                        ui.cancel_composition(cx)
-                    }
-                    DesktopEvent::PanelClose(id) if id == self.panel.id() => self.hide(ui, cx),
-                    DesktopEvent::HotkeyUnavailable => {
-                        self.initial_notice = Some("热键已被占用，请在设置中更换。".into())
-                    }
-                    DesktopEvent::Clipboard(sequence) => self.capture(sequence),
-                    _ => {}
+                DesktopEvent::CompositionEnded(id) if id == self.panel.id() => {
+                    ui.cancel_composition(cx)
                 }
-            }
+                DesktopEvent::PanelClose(id) if id == self.panel.id() => self.hide(ui, cx),
+                DesktopEvent::HotkeyUnavailable => {
+                    self.initial_notice = Some("热键已被占用，请在设置中更换。".into())
+                }
+                DesktopEvent::Clipboard(sequence) => self.capture(sequence),
+                _ => {}
+            },
             Event::Ui(intent) => match intent {
                 Intent::Hide => self.hide(ui, cx),
                 Intent::Search(page, query) if self.panel.visible() && !self.closing => {
@@ -194,7 +224,7 @@ impl Controller {
                 Intent::Preview(id) => self.preview(id),
                 Intent::Settings(settings) => self.apply_settings(settings, ui, window, cx),
                 Intent::ClearClipboard => self.clear_clipboard(),
-                Intent::Resize(compact) => self.resize(compact),
+                Intent::Resize(_) => unreachable!("handled before entering the GPUI window update"),
                 Intent::CopyInput(text) => self.copy(ClipboardData::Text(text), None, false),
                 Intent::PasteInput(focus) => {
                     let seq = self.visibility_seq;
@@ -381,13 +411,6 @@ impl Controller {
                 WorkerEvent::Hide(seq) if seq == self.visibility_seq && self.closing => {
                     self.hide_now(true, ui, cx)
                 }
-                WorkerEvent::Resize(seq, height)
-                    if seq == self.resize_seq && self.panel.visible() =>
-                {
-                    if let Err(error) = self.panel.resize(height) {
-                        ui.toast(format!("调整面板失败：{error}"), window, cx);
-                    }
-                }
                 WorkerEvent::Expire => self.expire(),
                 _ => {}
             },
@@ -404,15 +427,15 @@ impl Controller {
     fn show(
         &mut self,
         page: Option<Page>,
-        ui: &mut CommandPalette,
-        window: &mut Window,
-        cx: &mut Context<CommandPalette>,
-    ) {
+        window: WindowHandle<CommandPalette>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         self.visibility_seq = self.visibility_seq.wrapping_add(1);
         self.resize_seq = self.resize_seq.wrapping_add(1);
         self.closing = false;
         let start = Instant::now();
-        let height = if ui.compact() && page != Some(Page::Settings) {
+        let compact = window.read_with(cx, |ui, _| ui.compact())?;
+        let height = if compact && page != Some(Page::Settings) {
             COMPACT_HEIGHT
         } else {
             PANEL_HEIGHT
@@ -422,10 +445,12 @@ impl Controller {
             .show(PANEL_WIDTH, height, self.settings.allow_fullscreen)
         {
             Ok(true) => {
-                ui.show(page, window, cx);
-                if let Some(message) = self.initial_notice.take() {
-                    ui.toast(message, window, cx);
-                }
+                window.update(cx, |ui, window, cx| {
+                    ui.show(page, window, cx);
+                    if let Some(message) = self.initial_notice.take() {
+                        ui.toast(message, window, cx);
+                    }
+                })?;
                 if self.trace {
                     eprintln!(
                         "visible: {}, active: {}, activation: {} ms",
@@ -442,6 +467,7 @@ impl Controller {
             }
             Err(error) => eprintln!("show: {error:#}"),
         }
+        Ok(())
     }
 
     fn hide(&mut self, ui: &mut CommandPalette, cx: &mut Context<CommandPalette>) {
@@ -486,9 +512,9 @@ impl Controller {
         }
     }
 
-    fn resize(&mut self, compact: bool) {
+    fn resize(&mut self, compact: bool) -> Result<()> {
         if !self.panel.visible() {
-            return;
+            return Ok(());
         }
         self.resize_seq = self.resize_seq.wrapping_add(1);
         let goal = if compact {
@@ -497,9 +523,11 @@ impl Controller {
             PANEL_HEIGHT
         };
         let current = self.panel.height();
+        if current == goal {
+            return Ok(());
+        }
         if !self.settings.animations || current == 0 {
-            let _ = self.panel.resize(goal);
-            return;
+            return self.panel.resize(goal);
         }
         let seq = self.resize_seq;
         let events = self.events.clone();
@@ -514,6 +542,7 @@ impl Controller {
                 }
             }
         });
+        Ok(())
     }
 
     fn search(&mut self, page: Page, query: String) {

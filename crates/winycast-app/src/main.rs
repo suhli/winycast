@@ -125,12 +125,7 @@ fn run() -> Result<()> {
                         let _ = cx.update(|cx| cx.quit());
                         break;
                     }
-                    if window
-                        .update(cx, |ui, window, cx| {
-                            controller.handle(event, ui, window, cx)
-                        })
-                        .is_err()
-                    {
+                    if controller.handle(event, window, cx).is_err() {
                         break;
                     }
                 }
@@ -143,4 +138,94 @@ fn run() -> Result<()> {
         }
     });
     status.replace(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use anyhow::{Context as _, Result};
+    use gpui::{
+        AppContext, Application, Bounds, Context, IntoElement, Render, Window, WindowBounds,
+        WindowKind, WindowOptions, div, px, size,
+    };
+    use winycast_platform_windows::{Panel, enable_per_monitor_dpi};
+    use winycast_ui::{COMPACT_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
+
+    #[test]
+    #[ignore = "requires the Windows GPUI graphics backend"]
+    fn native_resize_updates_gpui_viewport() -> Result<()> {
+        enable_per_monitor_dpi();
+        let status = Rc::new(RefCell::new(None));
+        let outcome = status.clone();
+        Application::new().run(move |cx| {
+            let setup = (|| -> Result<_> {
+                let window = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                            None,
+                            size(px(PANEL_WIDTH as f32), px(PANEL_HEIGHT as f32)),
+                            cx,
+                        ))),
+                        titlebar: None,
+                        kind: WindowKind::PopUp,
+                        focus: false,
+                        show: false,
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| EmptyView),
+                )?;
+                let panel = window.update(cx, |_, window, _| Panel::attach(window))??;
+                Ok((window, panel))
+            })();
+            let (window, panel) = match setup {
+                Ok(ready) => ready,
+                Err(error) => {
+                    *outcome.borrow_mut() = Some(Err(error));
+                    cx.quit();
+                    return;
+                }
+            };
+            cx.spawn(async move |cx| {
+                let result = (|| -> Result<()> {
+                    for height in [
+                        240,
+                        COMPACT_HEIGHT,
+                        256,
+                        PANEL_HEIGHT,
+                        COMPACT_HEIGHT,
+                        PANEL_HEIGHT,
+                    ] {
+                        panel.resize(height)?;
+                        // The outer HWND has an invisible frame. GPUI's bounds
+                        // report the client size from WM_SIZE, independent of the viewport.
+                        let (client, viewport) = window.update(cx, |_, window, _| {
+                            (window.bounds().size.height, window.viewport_size().height)
+                        })?;
+                        anyhow::ensure!(
+                            viewport == client && (panel.height() - height).abs() <= 1,
+                            "expected outer height {height}px, got {}px, client {client:?}, viewport {viewport:?}",
+                            panel.height()
+                        );
+                    }
+                    Ok(())
+                })();
+                *outcome.borrow_mut() = Some(result);
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+        status
+            .borrow_mut()
+            .take()
+            .context("resize test did not run")?
+    }
+
+    struct EmptyView;
+
+    impl Render for EmptyView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
 }
