@@ -6,5 +6,6 @@ rust-version.workspace = true
 
 [dependencies]
 pinyin.workspace = true
+pulldown-cmark.workspace = true
 serde.workspace = true
 url.workspace = true

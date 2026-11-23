@@ -22,6 +22,7 @@ futures-lite = "=2.6.1"
 gpui = { version = "=0.2.2", default-features = false }
 image = { version = "=0.25.10", default-features = false, features = ["bmp", "png"] }
 pinyin = "=0.10.0"
+pulldown-cmark = { version = "=0.13.0", default-features = false }
 raw-window-handle = "=0.6.2"
 rusqlite = { version = "=0.32.1", features = ["bundled", "functions"] }
 serde = { version = "=1.0.229", features = ["derive"] }

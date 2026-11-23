@@ -1,10 +1,15 @@
 mod calculator;
+mod note;
 mod search;
 mod shortcut;
 
 use serde::{Deserialize, Serialize};
 
 pub use calculator::calculate;
+pub use note::{
+    MARKDOWN_LIMIT, MarkdownBlock, MarkdownBlockKind, MarkdownSpan, MarkdownStyle, Note, NoteDraft,
+    NoteVersion, markdown_preview, note_entry_id,
+};
 pub use search::{Entry, Usage, rank, unix_time};
 pub use shortcut::{Shortcut, ShortcutDraft, ShortcutKind, shortcut_entry_id, web_address};
 
@@ -17,6 +22,7 @@ pub enum Page {
     ClipboardLinks,
     Files,
     Shortcuts,
+    Notes,
     Settings,
 }
 
@@ -32,6 +38,7 @@ pub enum Command {
     Page(Page),
     System(SystemCommand),
     CreateShortcut(ShortcutKind),
+    CreateNote,
     Rescan,
 }
 
@@ -67,6 +74,18 @@ pub fn commands() -> Vec<Entry> {
             "常用文本与链接",
             "Snippets Quicklinks Shortcuts 常用项",
             Page(crate::Page::Shortcuts),
+        ),
+        (
+            "notes",
+            "搜索 Markdown 笔记",
+            "Search Notes Markdown 笔记",
+            Page(crate::Page::Notes),
+        ),
+        (
+            "create-note",
+            "新建 Markdown 笔记",
+            "Create Note Markdown 笔记",
+            CreateNote,
         ),
         (
             "create-snippet",
@@ -122,6 +141,7 @@ pub enum Target {
     CopyText(String),
     Clip(i64, ClipKind),
     Shortcut(i64, ShortcutKind),
+    Note(i64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

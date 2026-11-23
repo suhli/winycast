@@ -26,7 +26,7 @@ pub struct SearchService {
 mod tests {
     use std::path::Path;
 
-    use winycast_core::{ShortcutDraft, ShortcutKind};
+    use winycast_core::{NoteDraft, ShortcutDraft, ShortcutKind};
 
     use super::*;
 
@@ -106,6 +106,35 @@ mod tests {
                 .await?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn searches_note_titles_and_full_bodies() -> Result<()> {
+        let storage = Storage::open(Path::new(":memory:"))?;
+        let note = storage.save_note(
+            None,
+            NoteDraft {
+                title: "项目记录".into(),
+                markdown: format!("{}\n独特关键词 MIXEDcase", "前".repeat(300)),
+            },
+        )?;
+        let target = Target::Note(note.version.id);
+        let service = SearchService::new(storage.clone());
+        let cancel = CancellationToken::new();
+        for (page, query) in [
+            (Page::Launcher, "xmjl"),
+            (Page::Launcher, "独特关键词"),
+            (Page::Notes, "项目 mixedcase"),
+        ] {
+            let results = service.search(page, query.into(), cancel.clone()).await?;
+            assert!(results.iter().any(|row| row.entry.target == target), "{query}");
+        }
+        assert!(service.search(Page::Notes, "不存在".into(), cancel.clone()).await?.is_empty());
+        cancel.cancel();
+        assert!(service.search(Page::Notes, "项目".into(), cancel).await?.is_empty());
+        storage.delete_note(note.version.id)?;
+        assert!(service.search(Page::Notes, String::new(), CancellationToken::new()).await?.is_empty());
         Ok(())
     }
 }
@@ -195,6 +224,16 @@ impl SearchService {
                 cancel.is_cancelled()
             }));
         }
+        let notes = if matches!(page, Page::Launcher | Page::Notes) {
+            self.storage.note_entries(query, || cancel.is_cancelled())?
+        } else {
+            Vec::new()
+        };
+        if page == Page::Notes {
+            return Ok(rank(&notes, query, &self.storage.usage()?, || {
+                cancel.is_cancelled()
+            }));
+        }
         if page == Page::Files {
             return Ok(
                 winycast_platform_windows::search_files(query, || cancel.is_cancelled())?
@@ -232,7 +271,8 @@ impl SearchService {
             windows
                 .iter()
                 .chain(general.into_iter().flatten())
-                .chain(&shortcuts),
+                .chain(&shortcuts)
+                .chain(&notes),
             query,
             &usage,
             || cancel.is_cancelled(),

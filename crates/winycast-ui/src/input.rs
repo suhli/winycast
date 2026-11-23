@@ -101,6 +101,14 @@ impl SearchInput {
         input
     }
 
+    pub fn note_body(intents: async_channel::Sender<Intent>, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::shortcut_field(intents, true, cx);
+        input.layout.rows = 8;
+        input.layout.line_height = 23.;
+        input.layout.limit = winycast_core::MARKDOWN_LIMIT;
+        input
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -304,25 +312,22 @@ impl SearchInput {
     }
 
     fn shape_visible_lines(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Geometry {
+        let active = self.text.as_bytes()[..self.caret]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        let top = (active + 1).saturating_sub(self.layout.rows);
         let mut start = 0;
-        let ranges: Vec<_> = self
+        let ranges = self
             .text
             .split('\n')
             .map(|line| {
                 let range = start..start + line.len();
                 start = range.end + 1;
                 range
-            })
-            .collect();
-        let active = ranges.partition_point(|line| line.end < self.caret);
-        let top = if active >= self.layout.rows {
-            active + 1 - self.layout.rows
-        } else {
-            0
-        };
+            });
         let empty = self.text.is_empty();
         let lines = ranges
-            .into_iter()
             .skip(top)
             .take(self.layout.rows)
             .map(|range| {

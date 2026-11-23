@@ -8,7 +8,7 @@ pub use palette::CommandPalette;
 use std::sync::Arc;
 
 use gpui::{FocusHandle, Image};
-use winycast_core::{Page, Settings, ShortcutDraft, ShortcutKind, Target};
+use winycast_core::{NoteDraft, NoteVersion, Page, Settings, ShortcutDraft, ShortcutKind, Target};
 
 pub const PANEL_WIDTH: i32 = 666;
 pub const PANEL_HEIGHT: i32 = 414;
@@ -49,6 +49,20 @@ pub enum Intent {
         draft: ShortcutDraft,
     },
     DeleteShortcut(i64),
+    LoadNote {
+        request: u64,
+        id: i64,
+    },
+    SaveNote {
+        session: u64,
+        version: Option<NoteVersion>,
+        draft: NoteDraft,
+    },
+    DeleteNote(i64),
+    RenderNote {
+        request: u64,
+        markdown: String,
+    },
 }
 
 pub type Preview = Arc<Image>;

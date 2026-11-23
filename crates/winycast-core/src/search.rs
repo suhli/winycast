@@ -14,6 +14,7 @@ pub struct Entry {
     pub detail: String,
     pub target: Target,
     keys: Vec<String>,
+    content_match: bool,
 }
 
 impl Entry {
@@ -24,6 +25,7 @@ impl Entry {
             detail,
             target,
             keys: Vec::new(),
+            content_match: false,
         }
     }
 
@@ -67,7 +69,13 @@ impl Entry {
             detail: detail.into(),
             target,
             keys,
+            content_match: false,
         }
+    }
+
+    pub fn with_content_match(mut self, matched: bool) -> Self {
+        self.content_match = matched;
+        self
     }
 }
 
@@ -157,7 +165,7 @@ pub fn rank<'a>(
                 .max()
                 .map(|score| sum + score)
         });
-        let Some(relevance) = relevance else {
+        let Some(relevance) = relevance.or(entry.content_match.then_some(100)) else {
             continue;
         };
         let use_data = usage.get(&entry.id).copied().unwrap_or_default();

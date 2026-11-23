@@ -1,3 +1,4 @@
+mod notes;
 mod shortcuts;
 
 use std::{
@@ -63,6 +64,12 @@ impl Storage {
                 kind INTEGER NOT NULL CHECK(kind IN (0, 1)),
                 title TEXT NOT NULL,
                 body TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                title TEXT NOT NULL,
+                markdown TEXT NOT NULL
              );",
         )?;
         let migration = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
