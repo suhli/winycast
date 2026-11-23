@@ -4,13 +4,16 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, functions::FunctionFlags, params,
+};
 use sha2::{Digest, Sha256};
-use winycast_core::{ClipboardData, Entry, Row, Settings, Target, Usage};
+pub use winycast_core::unix_time;
+use winycast_core::{ClipKind, ClipboardData, Entry, Row, Settings, Target, Usage, web_address};
 
 const UNPINNED_LIMIT: i64 = 200;
 
@@ -25,7 +28,7 @@ impl Storage {
         Self::configure(Connection::open(path)?)
     }
 
-    fn configure(connection: Connection) -> Result<Self> {
+    fn configure(mut connection: Connection) -> Result<Self> {
         connection.busy_timeout(Duration::from_millis(700))?;
         connection.execute_batch(
             "PRAGMA journal_mode = DELETE;
@@ -38,7 +41,8 @@ impl Storage {
              CREATE TABLE IF NOT EXISTS usage (
                 id TEXT PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                last_used INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS clipboard (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +64,30 @@ impl Storage {
                 title TEXT NOT NULL,
                 body TEXT NOT NULL
              );",
+        )?;
+        let migration = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_last_used: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage') WHERE name = 'last_used')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_last_used {
+            migration.execute(
+                "ALTER TABLE usage ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        migration.commit()?;
+        connection.create_scalar_function(
+            "is_web_address",
+            1,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8,
+            |context| {
+                Ok(context
+                    .get_raw(0)
+                    .as_str()
+                    .is_ok_and(|value| web_address(value).is_some()))
+            },
         )?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
@@ -105,13 +133,14 @@ impl Storage {
 
     pub fn usage(&self) -> Result<HashMap<String, Usage>> {
         self.with(|connection| {
-            let mut query = connection.prepare("SELECT id, count, pinned FROM usage")?;
+            let mut query = connection.prepare("SELECT id, count, pinned, last_used FROM usage")?;
             let rows = query.query_map([], |row| {
                 Ok((
                     row.get(0)?,
                     Usage {
                         count: row.get(1)?,
                         pinned: row.get(2)?,
+                        last_used: row.get(3)?,
                     },
                 ))
             })?;
@@ -122,9 +151,10 @@ impl Storage {
     pub fn used(&self, id: &str) -> Result<()> {
         self.with(|connection| {
             connection.execute(
-                "INSERT INTO usage(id, count) VALUES (?1, 1)
-                 ON CONFLICT(id) DO UPDATE SET count = min(count + 1, 1000000)",
-                [id],
+                "INSERT INTO usage(id, count, last_used) VALUES (?1, 1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET count = min(count + 1, 1000000),
+                    last_used = max(last_used, excluded.last_used)",
+                params![id, unix_time()],
             )?;
             Ok(())
         })
@@ -180,17 +210,31 @@ impl Storage {
     }
 
     pub fn clips(&self, query: &str, cancelled: impl Fn() -> bool) -> Result<Vec<Row>> {
+        self.search_clips(query, false, cancelled)
+    }
+
+    pub fn clip_links(&self, query: &str, cancelled: impl Fn() -> bool) -> Result<Vec<Row>> {
+        self.search_clips(query, true, cancelled)
+    }
+
+    fn search_clips(
+        &self,
+        query: &str,
+        links_only: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<Row>> {
         self.with(|connection| {
             let mut stmt = connection.prepare(
-                "SELECT id, kind, substr(text, 1, 768), pinned
+                "SELECT id, kind, substr(text, 1, 768), pinned, is_web_address(text)
                  FROM clipboard LEFT JOIN clipboard_image_ocr ON clip_id = id
-                 WHERE ?1 = '' OR case kind
+                 WHERE (?3 = 0 OR (kind = 0 AND is_web_address(text)))
+                 AND (?1 = '' OR case kind
                     WHEN 0 THEN instr(lower(text), lower(?1)) > 0
                     ELSE instr('图片 image png', lower(?1)) > 0
-                        OR (?2 <> '' AND instr(search_text, ?2) > 0) END
+                        OR (?2 <> '' AND instr(search_text, ?2) > 0) END)
                  ORDER BY pinned DESC, seen DESC, id DESC LIMIT 500",
             )?;
-            let mut rows = stmt.query(params![query.trim(), ocr_search_text(query)])?;
+            let mut rows = stmt.query(params![query.trim(), ocr_search_text(query), links_only])?;
             let mut results = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancelled() {
@@ -198,7 +242,7 @@ impl Storage {
                 }
                 let id: i64 = row.get(0)?;
                 let kind: i64 = row.get(1)?;
-                let (title, detail) = if kind == 0 {
+                let (title, detail, kind) = if kind == 0 {
                     let sample: String = row.get(2)?;
                     let title = sample
                         .lines()
@@ -208,13 +252,24 @@ impl Storage {
                         .chars()
                         .take(120)
                         .collect::<String>();
-                    (title, sample)
+                    let kind = if row.get::<_, bool>(4)? {
+                        ClipKind::Link
+                    } else {
+                        ClipKind::Text
+                    };
+                    (title, sample, kind)
                 } else {
-                    ("图片".into(), "PNG · 剪贴板图片".into())
+                    ("图片".into(), "PNG · 剪贴板图片".into(), ClipKind::Image)
                 };
                 results.push(Row {
-                    entry: Entry::display(format!("clip:{id}"), title, detail, Target::Clip(id)),
+                    entry: Entry::display(
+                        format!("clip:{id}"),
+                        title,
+                        detail,
+                        Target::Clip(id, kind),
+                    ),
                     pinned: row.get(3)?,
+                    suggested: false,
                 });
             }
             Ok(results)
@@ -310,12 +365,6 @@ fn expire(connection: &Connection, now: i64, days: u16) -> Result<usize> {
     )?)
 }
 
-pub fn unix_time() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +388,56 @@ mod tests {
     }
 
     #[test]
+    fn migrates_existing_usage_and_records_recent_launches() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE usage (id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO usage VALUES ('app:legacy', 7, 1);",
+        )?;
+        let storage = Storage::configure(connection)?;
+        let prior = storage.usage()?["app:legacy"];
+        assert_eq!(prior.count, 7);
+        assert!(prior.pinned);
+        assert_eq!(prior.last_used, 0);
+        storage.used("app:legacy")?;
+        let current = storage.usage()?["app:legacy"];
+        assert_eq!(current.count, 8);
+        assert!(current.pinned);
+        assert!(current.last_used > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn clipboard_link_filter_keeps_only_web_urls_and_honors_search() -> Result<()> {
+        let storage = Storage::configure(Connection::open_in_memory()?)?;
+        for (seen, text) in [
+            (1, "see https://example.org/"),
+            (2, "file:///C:/example.org"),
+            (3, "https://example.org/docs"),
+            (4, "http://example.com/"),
+        ] {
+            storage.add_clip(ClipboardData::Text(text.into()), seen, 30)?;
+        }
+        storage.add_clip(ClipboardData::Png(vec![1, 2]), 5, 30)?;
+        let all = storage.clips("", || false)?;
+        assert_eq!(all.len(), 5);
+        assert!(matches!(
+            all[0].entry.target,
+            Target::Clip(_, ClipKind::Image)
+        ));
+        assert_eq!(storage.clip_links("", || false)?.len(), 2);
+        let links = storage.clip_links("docs", || false)?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].entry.title, "https://example.org/docs");
+        assert!(matches!(
+            links[0].entry.target,
+            Target::Clip(_, ClipKind::Link)
+        ));
+        assert!(storage.clip_links("", || true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn history_deduplicates_preserves_pins_expires_and_clears() -> Result<()> {
         let storage = Storage::configure(Connection::open_in_memory()?)?;
         storage.add_clip(ClipboardData::Text("Example 北京".into()), 1, 30)?;
@@ -346,7 +445,7 @@ mod tests {
         storage.add_clip(ClipboardData::Png(vec![1, 2, 3]), 3, 30)?;
         let rows = storage.clips("北京", || false)?;
         assert_eq!(rows.len(), 1);
-        let Target::Clip(id) = rows[0].entry.target else {
+        let Target::Clip(id, ClipKind::Text) = rows[0].entry.target else {
             panic!()
         };
         storage.toggle_clip_pin(id)?;
@@ -381,7 +480,7 @@ mod tests {
         assert!(storage.pending_image_ocr()?.is_empty());
         assert_eq!(
             storage.clips("中文识别", || false)?[0].entry.target,
-            Target::Clip(pinned)
+            Target::Clip(pinned, ClipKind::Image)
         );
         assert_eq!(storage.clips("winycast ocr", || false)?.len(), 1);
         assert_eq!(storage.clips("png", || false)?.len(), 2);

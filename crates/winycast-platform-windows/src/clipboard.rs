@@ -103,34 +103,35 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
     String::from_utf16(&wide).ok()
 }
 
-fn private_source() -> bool {
+fn private_source(skip_own: bool) -> bool {
     unsafe {
         let Ok(owner) = GetClipboardOwner() else {
             return true;
         };
         let mut pid = 0;
         GetWindowThreadProcessId(owner, Some(&mut pid));
-        if pid == 0 || pid == GetCurrentProcessId() {
+        if pid == 0 || skip_own && pid == GetCurrentProcessId() {
             return true;
         }
-        let Some(name) = process_name(pid) else {
-            return true;
-        };
-        let name = name.to_ascii_lowercase();
-        [
-            "keepass",
-            "1password",
-            "bitwarden",
-            "lastpass",
-            "enpass",
-            "dashlane",
-            "protonpass",
-            "credentialui",
-            "authenticator",
-        ]
-        .iter()
-        .any(|pattern| name.contains(pattern))
+        process_name(pid).is_none_or(|name| private_application(&name))
     }
+}
+
+pub(crate) fn private_application(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "keepass",
+        "1password",
+        "bitwarden",
+        "lastpass",
+        "enpass",
+        "dashlane",
+        "protonpass",
+        "credentialui",
+        "authenticator",
+    ]
+    .iter()
+    .any(|pattern| name.contains(pattern))
 }
 
 pub(crate) fn private_text(text: &str) -> bool {
@@ -184,13 +185,8 @@ pub fn capture(sequence: u32) -> Result<Option<ClipboardData>> {
     }
     let clipboard = Opened::open(None)?;
     if unsafe { GetClipboardSequenceNumber() } != sequence
-        || private_source()
-        || has(FORMATS.excluded)
-        || has(FORMATS.password_manager)
-        || (has(FORMATS.os_history)
-            && clipboard
-                .data(FORMATS.os_history, 256)
-                .is_none_or(|info| info.get(..4) != Some(&1u32.to_le_bytes())))
+        || private_source(true)
+        || excluded(&clipboard)
     {
         return Ok(None);
     }
@@ -266,6 +262,23 @@ fn dib_to_png(dib: Vec<u8>) -> Result<Vec<u8>> {
 
 pub fn read_text() -> Result<Option<String>> {
     Ok(Opened::open(None)?.text())
+}
+
+pub fn read_shortcut_clipboard() -> Result<Option<String>> {
+    let clipboard = Opened::open(None)?;
+    if excluded(&clipboard) || private_source(false) {
+        return Ok(None);
+    }
+    Ok(clipboard.text().filter(|text| !private_text(text)))
+}
+
+fn excluded(clipboard: &Opened) -> bool {
+    has(FORMATS.excluded)
+        || has(FORMATS.password_manager)
+        || (has(FORMATS.os_history)
+            && clipboard
+                .data(FORMATS.os_history, 256)
+                .is_none_or(|info| info.get(..4) != Some(&1u32.to_le_bytes())))
 }
 
 pub fn thumbnail(png: &[u8]) -> Result<Vec<u8>> {

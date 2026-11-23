@@ -24,6 +24,17 @@ pub struct ShortcutDraft {
 }
 
 impl ShortcutDraft {
+    pub fn new(kind: ShortcutKind, body: String) -> Self {
+        let title = if kind == ShortcutKind::Quicklink {
+            web_address(&body)
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Self { kind, title, body }
+    }
+
     pub fn validated(mut self) -> Result<Self, &'static str> {
         self.title = self.title.trim().to_owned();
         if self.title.is_empty() || self.title.len() > 256 || self.title.contains(char::is_control)
@@ -34,13 +45,7 @@ impl ShortcutDraft {
             return Err("请输入有效内容（最多 8 KiB）");
         }
         if self.kind == ShortcutKind::Quicklink {
-            let address = self.body.trim();
-            let parsed = url::Url::parse(address).ok().filter(|url| {
-                !address.contains(char::is_control)
-                    && matches!(url.scheme(), "http" | "https")
-                    && url.has_host()
-            });
-            let parsed = parsed.ok_or("请输入有效的 HTTP 或 HTTPS 网址")?;
+            let parsed = web_address(&self.body).ok_or("请输入有效的 HTTP 或 HTTPS 网址")?;
             self.body = parsed.into();
             if self.body.len() > 8192 {
                 return Err("网址过长（转义后最多 8 KiB）");
@@ -48,6 +53,18 @@ impl ShortcutDraft {
         }
         Ok(self)
     }
+}
+
+pub fn web_address(value: &str) -> Option<url::Url> {
+    let value = value.trim();
+    let scheme = value.split_once(':')?.0;
+    if value.len() > 8192
+        || !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || value.contains(char::is_control)
+    {
+        return None;
+    }
+    url::Url::parse(value).ok().filter(url::Url::has_host)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

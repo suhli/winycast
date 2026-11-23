@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use pinyin::ToPinyin;
 
@@ -72,6 +75,28 @@ impl Entry {
 pub struct Usage {
     pub count: u32,
     pub pinned: bool,
+    pub last_used: i64,
+}
+
+impl Usage {
+    pub fn weight(self, now: i64) -> i32 {
+        let age_days = now.saturating_sub(self.last_used).max(0) / 86400;
+        let recent = if self.last_used > 0 && self.count > 0 {
+            [25, 15, 10, 5]
+                .get((age_days / 7) as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (self.count.min(1000) as f64).ln_1p().mul_add(10., 0.) as i32 + recent
+    }
+}
+
+pub fn unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 fn match_score(key: &str, token: &str) -> Option<i32> {
@@ -115,6 +140,7 @@ pub fn rank<'a>(
 ) -> Vec<Row> {
     let query = query.to_lowercase();
     let tokens: Vec<_> = query.split_whitespace().collect();
+    let now = unix_time();
     let mut ranked = Vec::new();
     for entry in entries {
         if cancelled() {
@@ -135,8 +161,7 @@ pub fn rank<'a>(
             continue;
         };
         let use_data = usage.get(&entry.id).copied().unwrap_or_default();
-        let bonus = i32::from(use_data.pinned) * 130
-            + (use_data.count.min(1000) as f64).ln_1p().mul_add(10., 0.) as i32;
+        let bonus = i32::from(use_data.pinned) * 130 + use_data.weight(now);
         let default_bias =
             i32::from(tokens.is_empty() && matches!(entry.target, Target::Command(_))) * 100;
         ranked.push((relevance + bonus + default_bias, use_data.pinned, entry));
@@ -153,6 +178,7 @@ pub fn rank<'a>(
         .map(|(_, pinned, entry)| Row {
             entry: entry.clone(),
             pinned,
+            suggested: false,
         })
         .collect()
 }
@@ -189,6 +215,7 @@ mod tests {
                 Usage {
                     count: 10,
                     pinned: false,
+                    ..Usage::default()
                 },
             ),
             (
@@ -196,6 +223,7 @@ mod tests {
                 Usage {
                     count: 0,
                     pinned: true,
+                    ..Usage::default()
                 },
             ),
         ]);

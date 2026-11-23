@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, ensure};
 use rusqlite::{OptionalExtension, Row, params};
 use winycast_core::{Entry, Shortcut, ShortcutDraft, ShortcutKind, shortcut_entry_id};
 
-use crate::Storage;
+use crate::{Storage, unix_time};
 
 impl Storage {
     pub fn shortcuts(&self, cancelled: impl Fn() -> bool) -> Result<Vec<Entry>> {
@@ -68,9 +68,10 @@ impl Storage {
     pub fn record_shortcut_use(&self, id: i64) -> Result<()> {
         self.with(|connection| {
             connection.execute(
-                "INSERT INTO usage(id, count) SELECT ?1, 1 FROM shortcuts WHERE id = ?2
-                 ON CONFLICT(id) DO UPDATE SET count = min(count + 1, 1000000)",
-                params![shortcut_entry_id(id), id],
+                "INSERT INTO usage(id, count, last_used) SELECT ?1, 1, ?3 FROM shortcuts WHERE id = ?2
+                 ON CONFLICT(id) DO UPDATE SET count = min(count + 1, 1000000),
+                    last_used = max(last_used, excluded.last_used)",
+                params![shortcut_entry_id(id), id, unix_time()],
             )?;
             Ok(())
         })

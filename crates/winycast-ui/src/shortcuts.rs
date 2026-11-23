@@ -1,7 +1,7 @@
 use async_channel::Sender;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use winycast_core::{Shortcut, ShortcutDraft, ShortcutKind};
+use winycast_core::{ShortcutDraft, ShortcutKind};
 
 use crate::{
     Intent,
@@ -22,19 +22,12 @@ pub(crate) struct ShortcutEditor {
 impl ShortcutEditor {
     pub fn new(
         request: u64,
-        shortcut: Option<Shortcut>,
+        id: Option<i64>,
+        draft: ShortcutDraft,
         intents: &Sender<Intent>,
         cx: &mut Context<CommandPalette>,
     ) -> Self {
-        let (id, kind, title, body) = match shortcut {
-            Some(shortcut) => (
-                Some(shortcut.id),
-                shortcut.draft.kind,
-                shortcut.draft.title,
-                shortcut.draft.body,
-            ),
-            None => (None, ShortcutKind::Snippet, String::new(), String::new()),
-        };
+        let ShortcutDraft { kind, title, body } = draft;
         let title = cx.new(|cx| {
             let mut input = SearchInput::shortcut_field(intents.clone(), false, cx);
             input.set_text(title, cx);

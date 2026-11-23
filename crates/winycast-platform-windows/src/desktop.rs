@@ -27,7 +27,10 @@ use windows::Win32::{
     },
 };
 
-use crate::host::{DesktopEvent, panel_proc};
+use crate::{
+    host::{DesktopEvent, panel_proc},
+    shortcut_context::ShortcutContext,
+};
 
 pub fn enable_per_monitor_dpi() {
     // Do this before GPUI creates the dispatcher HWND.
@@ -42,6 +45,7 @@ pub struct PanelId(pub isize);
 pub struct Panel {
     hwnd: HWND,
     previous: HWND,
+    shortcut_context: Option<ShortcutContext>,
 }
 
 impl Panel {
@@ -74,6 +78,7 @@ impl Panel {
         Ok(Self {
             hwnd,
             previous: HWND::default(),
+            shortcut_context: None,
         })
     }
 
@@ -87,6 +92,10 @@ impl Panel {
 
     pub fn active(&self) -> bool {
         unsafe { GetForegroundWindow() == self.hwnd }
+    }
+
+    pub fn shortcut_context(&self) -> Option<ShortcutContext> {
+        self.shortcut_context
     }
 
     pub fn show(&mut self, width: i32, height: i32, allow_fullscreen: bool) -> Result<bool> {
@@ -116,6 +125,7 @@ impl Panel {
             let work_height = work.bottom - work.top;
             if !self.visible() {
                 self.previous = foreground;
+                self.shortcut_context = ShortcutContext::capture(foreground);
                 // First move into the monitor while hidden so WM_DPICHANGED updates GPUI.
                 SetWindowPos(
                     self.hwnd,
@@ -169,6 +179,7 @@ impl Panel {
             }
         }
         self.previous = HWND::default();
+        self.shortcut_context = None;
     }
 
     pub fn height(&self) -> i32 {

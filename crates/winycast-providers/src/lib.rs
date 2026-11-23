@@ -1,11 +1,15 @@
 mod clipboard_ocr;
 
-use std::sync::{Arc, RwLock};
+use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use winycast_core::{Entry, Page, Row, Target, calculate, commands, rank};
+use winycast_core::{Entry, Page, Row, Target, Usage, calculate, commands, rank, unix_time};
 use winycast_storage::Storage;
 
 pub use clipboard_ocr::index_clipboard_images;
@@ -25,6 +29,37 @@ mod tests {
     use winycast_core::{ShortcutDraft, ShortcutKind};
 
     use super::*;
+
+    #[test]
+    fn suggestions_promote_existing_entries_by_recent_use_without_duplicates() {
+        let now = 40 * 86400;
+        let mut usage = HashMap::new();
+        let mut rows = Vec::new();
+        for index in 0..8 {
+            let id = format!("app:{index}");
+            let pinned = index == 7;
+            usage.insert(
+                id.clone(),
+                Usage {
+                    count: if index == 0 { 0 } else { 6 },
+                    last_used: if index == 6 { now } else { 1 },
+                    pinned,
+                },
+            );
+            rows.push(Row {
+                entry: Entry::display(id.clone(), id.clone(), "".into(), Target::App(id.into())),
+                pinned,
+                suggested: false,
+            });
+        }
+        mark_suggestions(&mut rows, &usage, now);
+        assert_eq!(rows.len(), 8);
+        assert!(rows[0].pinned);
+        assert!(!rows[0].suggested);
+        assert_eq!(rows[1].entry.id, "app:6");
+        assert!(rows[1..6].iter().all(|row| row.suggested));
+        assert!(rows[6..].iter().all(|row| !row.suggested));
+    }
 
     #[tokio::test]
     async fn searches_saved_shortcuts_in_both_views() -> Result<()> {
@@ -147,6 +182,9 @@ impl SearchService {
         if page == Page::Clipboard {
             return self.storage.clips(query, || cancel.is_cancelled());
         }
+        if page == Page::ClipboardLinks {
+            return self.storage.clip_links(query, || cancel.is_cancelled());
+        }
         let shortcuts = if matches!(page, Page::Launcher | Page::Shortcuts) {
             self.storage.shortcuts(|| cancel.is_cancelled())?
         } else {
@@ -172,6 +210,7 @@ impl SearchService {
                                 Target::File(path),
                             ),
                             pinned: false,
+                            suggested: false,
                         })
                     })
                     .collect(),
@@ -198,6 +237,9 @@ impl SearchService {
             &usage,
             || cancel.is_cancelled(),
         );
+        if page == Page::Launcher && query.trim().is_empty() {
+            mark_suggestions(&mut rows, &usage, unix_time());
+        }
         if page == Page::Launcher
             && !cancel.is_cancelled()
             && let Some(value) = calculate(query)
@@ -212,9 +254,35 @@ impl SearchService {
                         Target::CopyText(value),
                     ),
                     pinned: false,
+                    suggested: false,
                 },
             );
         }
         Ok(rows)
     }
+}
+
+fn mark_suggestions(rows: &mut [Row], usage: &HashMap<String, Usage>, now: i64) {
+    let order = |row: &Row| {
+        let stats = usage.get(&row.entry.id).copied().unwrap_or_default();
+        Reverse((stats.weight(now), stats.last_used))
+    };
+    let mut candidates: Vec<_> = rows
+        .iter_mut()
+        .filter(|row| {
+            !row.pinned
+                && usage
+                    .get(&row.entry.id)
+                    .is_some_and(|stats| stats.count > 0)
+        })
+        .collect();
+    candidates.sort_by_key(|row| order(row));
+    for row in candidates.into_iter().take(5) {
+        row.suggested = true;
+    }
+    rows.sort_by_key(|row| match (row.pinned, row.suggested) {
+        (true, _) => (0, Reverse((0, 0))),
+        (false, true) => (1, order(row)),
+        (false, false) => (2, Reverse((0, 0))),
+    });
 }

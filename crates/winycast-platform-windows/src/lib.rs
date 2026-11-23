@@ -4,13 +4,15 @@ mod file_search;
 mod host;
 mod ocr;
 mod shell;
+mod shortcut_context;
 
-pub use clipboard::{ClipboardWriter, capture, read_text, thumbnail};
+pub use clipboard::{ClipboardWriter, capture, read_shortcut_clipboard, read_text, thumbnail};
 pub use desktop::{Panel, PanelId, enable_per_monitor_dpi};
 pub use file_search::search_files;
 pub use host::{DesktopEvent, DesktopHost, Instance};
 pub use ocr::ImageRecognizer;
 pub use shell::{activate, applications, launch, run_system, running_windows, set_startup};
+pub use shortcut_context::ShortcutContext;
 
 pub fn report_startup_error(message: &str) {
     use windows::{

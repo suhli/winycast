@@ -8,11 +8,18 @@ pub use palette::CommandPalette;
 use std::sync::Arc;
 
 use gpui::{FocusHandle, Image};
-use winycast_core::{Page, Settings, ShortcutDraft, Target};
+use winycast_core::{Page, Settings, ShortcutDraft, ShortcutKind, Target};
 
 pub const PANEL_WIDTH: i32 = 666;
 pub const PANEL_HEIGHT: i32 = 414;
 pub const COMPACT_HEIGHT: i32 = 112;
+
+#[derive(Debug)]
+pub enum ShortcutSource {
+    Existing(i64),
+    Context(ShortcutKind),
+    Clipboard(i64, ShortcutKind),
+}
 
 #[derive(Debug)]
 pub enum Intent {
@@ -34,7 +41,7 @@ pub enum Intent {
     PasteInput(FocusHandle),
     LoadShortcut {
         request: u64,
-        id: i64,
+        source: ShortcutSource,
     },
     SaveShortcut {
         request: u64,

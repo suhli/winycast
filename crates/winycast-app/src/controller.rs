@@ -13,11 +13,17 @@ use gpui::{AsyncApp, Context, FocusHandle, Image, ImageFormat, Window, WindowHan
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use winycast_core::{ClipboardData, Command, Page, Row, Settings, Shortcut, ShortcutKind, Target};
-use winycast_platform_windows::{self as native, DesktopEvent, DesktopHost, Panel};
+use winycast_core::{
+    ClipboardData, Command, Page, Row, Settings, ShortcutDraft, ShortcutKind, Target, web_address,
+};
+use winycast_platform_windows::{
+    self as native, DesktopEvent, DesktopHost, Panel, ShortcutContext,
+};
 use winycast_providers::{SearchService, index_clipboard_images};
 use winycast_storage::{Storage, unix_time};
-use winycast_ui::{COMPACT_HEIGHT, CommandPalette, Intent, PANEL_HEIGHT, PANEL_WIDTH, Preview};
+use winycast_ui::{
+    COMPACT_HEIGHT, CommandPalette, Intent, PANEL_HEIGHT, PANEL_WIDTH, Preview, ShortcutSource,
+};
 
 pub(crate) enum Event {
     Desktop(DesktopEvent),
@@ -39,7 +45,7 @@ pub(crate) enum WorkerEvent {
     ClipboardCleared(Result<()>),
     ClipboardOcr(CancellationToken, Result<usize>),
     Paste(u64, FocusHandle, Result<Option<String>>),
-    ShortcutLoaded(u64, Result<Shortcut>),
+    ShortcutLoaded(u64, Result<(Option<i64>, ShortcutDraft)>),
     ShortcutSaved(u64, Result<i64>),
     Hide(u64),
     Resize(u64, i32),
@@ -230,14 +236,13 @@ impl Controller {
                     let seq = self.visibility_seq;
                     self.background(move || WorkerEvent::Paste(seq, focus, native::read_text()));
                 }
-                Intent::LoadShortcut { request, id } => {
+                Intent::LoadShortcut { request, source } => {
                     let storage = self.storage.clone();
+                    let context = self.panel.shortcut_context();
                     self.background(move || {
                         WorkerEvent::ShortcutLoaded(
                             request,
-                            storage.shortcut(id).and_then(|shortcut| {
-                                shortcut.ok_or_else(|| anyhow!("常用项已移除"))
-                            }),
+                            load_shortcut(&storage, source, context),
                         )
                     });
                 }
@@ -701,6 +706,9 @@ impl Controller {
                 ui.open_page(page, window, cx);
                 self.record_use(id);
             }
+            Target::Command(Command::CreateShortcut(kind)) => {
+                ui.create_shortcut_from_context(kind, cx);
+            }
             Target::Command(Command::Rescan) => {
                 self.index(true);
                 self.record_use(id);
@@ -715,7 +723,7 @@ impl Controller {
                 }
                 Err(error) => ui.toast(format!("切换失败：{error}"), window, cx),
             },
-            Target::Clip(id) => {
+            Target::Clip(id, _) => {
                 let storage = self.storage.clone();
                 let writer = self.host.clipboard_writer();
                 self.background(move || {
@@ -799,7 +807,7 @@ impl Controller {
         let storage = self.storage.clone();
         self.background(move || WorkerEvent::Refresh {
             result: match target {
-                Target::Clip(id) => storage.toggle_clip_pin(id),
+                Target::Clip(id, _) => storage.toggle_clip_pin(id),
                 Target::Shortcut(id, _) => storage.toggle_shortcut_favorite(id),
                 _ => storage.toggle_favorite(&id),
             },
@@ -861,6 +869,80 @@ impl Drop for Controller {
         self.index_cancel.cancel();
         self.set_clipboard_ocr(false);
         self.clipboard_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn load_shortcut(
+    storage: &Storage,
+    source: ShortcutSource,
+    context: Option<ShortcutContext>,
+) -> Result<(Option<i64>, ShortcutDraft)> {
+    let (kind, body) = match source {
+        ShortcutSource::Existing(id) => {
+            let shortcut = storage
+                .shortcut(id)?
+                .ok_or_else(|| anyhow!("常用项已移除"))?;
+            return Ok((Some(shortcut.id), shortcut.draft));
+        }
+        ShortcutSource::Clipboard(id, kind) => {
+            let Some(ClipboardData::Text(body)) = storage.clip(id)? else {
+                anyhow::bail!("剪贴板文字已移除");
+            };
+            let body = match kind {
+                ShortcutKind::Snippet => body,
+                ShortcutKind::Quicklink => web_address(&body)
+                    .ok_or_else(|| anyhow!("这条记录不是有效的 HTTP 或 HTTPS 链接"))?
+                    .into(),
+            };
+            anyhow::ensure!(body.len() <= 8192, "内容超过常用项的 8 KiB 上限");
+            (kind, body)
+        }
+        ShortcutSource::Context(kind) => {
+            let body = match kind {
+                ShortcutKind::Snippet => context.and_then(ShortcutContext::selection),
+                ShortcutKind::Quicklink => {
+                    context.and_then(ShortcutContext::browser_url).or_else(|| {
+                        let text = native::read_shortcut_clipboard().ok().flatten()?;
+                        web_address(&text).map(String::from)
+                    })
+                }
+            };
+            (
+                kind,
+                body.filter(|value| value.len() <= 8192).unwrap_or_default(),
+            )
+        }
+    };
+    Ok((None, ShortcutDraft::new(kind, body)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        ClipboardData, Result, ShortcutKind, ShortcutSource, Storage, Target, load_shortcut,
+    };
+
+    #[test]
+    fn clipboard_creates_an_editable_draft_until_saved() -> Result<()> {
+        let storage = Storage::open(Path::new(":memory:"))?;
+        let url = "https://example.org/docs";
+        storage.add_clip(ClipboardData::Text(url.into()), 1, 30)?;
+        let rows = storage.clip_links("", || false)?;
+        let Target::Clip(id, _) = rows[0].entry.target else {
+            panic!("expected a clipboard target");
+        };
+        for kind in [ShortcutKind::Snippet, ShortcutKind::Quicklink] {
+            let (existing, draft) =
+                load_shortcut(&storage, ShortcutSource::Clipboard(id, kind), None)?;
+            assert_eq!(existing, None);
+            assert_eq!(draft.kind, kind);
+            assert_eq!(draft.body, url);
+        }
+        assert!(storage.shortcuts(|| false)?.is_empty());
+        assert_eq!(storage.clips("", || false)?.len(), 1);
+        Ok(())
     }
 }
 

@@ -5,8 +5,8 @@ mod shortcut;
 use serde::{Deserialize, Serialize};
 
 pub use calculator::calculate;
-pub use search::{Entry, Usage, rank};
-pub use shortcut::{Shortcut, ShortcutDraft, ShortcutKind, shortcut_entry_id};
+pub use search::{Entry, Usage, rank, unix_time};
+pub use shortcut::{Shortcut, ShortcutDraft, ShortcutKind, shortcut_entry_id, web_address};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Page {
@@ -14,6 +14,7 @@ pub enum Page {
     Launcher,
     Windows,
     Clipboard,
+    ClipboardLinks,
     Files,
     Shortcuts,
     Settings,
@@ -30,6 +31,7 @@ pub enum SystemCommand {
 pub enum Command {
     Page(Page),
     System(SystemCommand),
+    CreateShortcut(ShortcutKind),
     Rescan,
 }
 
@@ -65,6 +67,18 @@ pub fn commands() -> Vec<Entry> {
             "常用文本与链接",
             "Snippets Quicklinks Shortcuts 常用项",
             Page(crate::Page::Shortcuts),
+        ),
+        (
+            "create-snippet",
+            "从选中文字新建常用文本",
+            "Create Snippet 新建片段",
+            CreateShortcut(ShortcutKind::Snippet),
+        ),
+        (
+            "create-quicklink",
+            "新建快捷链接",
+            "Create Quicklink 当前网页 网址",
+            CreateShortcut(ShortcutKind::Quicklink),
         ),
         (
             "windows-settings",
@@ -106,7 +120,7 @@ pub enum Target {
     Window(WindowTarget),
     Command(Command),
     CopyText(String),
-    Clip(i64),
+    Clip(i64, ClipKind),
     Shortcut(i64, ShortcutKind),
 }
 
@@ -120,6 +134,14 @@ pub struct WindowTarget {
 pub struct Row {
     pub entry: Entry,
     pub pinned: bool,
+    pub suggested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipKind {
+    Text,
+    Link,
+    Image,
 }
 
 #[derive(Clone, Debug)]

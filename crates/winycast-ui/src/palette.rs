@@ -4,11 +4,12 @@ use async_channel::Sender;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use winycast_core::{
-    Command, Hotkey, Page, Row, Settings, Shortcut, ShortcutKind, SystemCommand, Target, Theme,
+    ClipKind, Command, Hotkey, Page, Row, Settings, ShortcutDraft, ShortcutKind, SystemCommand,
+    Target, Theme,
 };
 
 use crate::{
-    Intent, Preview,
+    Intent, Preview, ShortcutSource,
     input::{QueryChanged, SearchInput},
     settings::SettingsWindow,
     shortcuts::ShortcutEditor,
@@ -86,12 +87,20 @@ enum ResultAction {
     Pin,
     EditShortcut,
     DeleteShortcut,
+    SaveClipboardAs(ShortcutKind),
 }
 
 fn result_actions(target: &Target) -> &'static [ResultAction] {
     use ResultAction::*;
     match target {
         Target::Shortcut(..) => &[Run, EditShortcut, Pin, DeleteShortcut],
+        Target::Clip(_, ClipKind::Text) => &[Run, Pin, SaveClipboardAs(ShortcutKind::Snippet)],
+        Target::Clip(_, ClipKind::Link) => &[
+            Run,
+            Pin,
+            SaveClipboardAs(ShortcutKind::Snippet),
+            SaveClipboardAs(ShortcutKind::Quicklink),
+        ],
         _ if can_pin(target) => &[Run, Pin],
         _ => &[Run],
     }
@@ -136,6 +145,7 @@ pub struct CommandPalette {
     overlay: Option<Overlay>,
     menu_index: usize,
     preview: Option<(i64, Preview)>,
+    clipboard_links: bool,
     shortcut_request: u64,
     loading_shortcut: Option<u64>,
     shortcut_editor: Option<ShortcutEditor>,
@@ -157,6 +167,7 @@ impl CommandPalette {
             this.query = event.0.clone();
             this.list.index = 0;
             this.overlay = None;
+            this.loading_shortcut = None;
             this.request_search();
             cx.notify();
         });
@@ -182,6 +193,7 @@ impl CommandPalette {
             overlay: None,
             menu_index: 0,
             preview: None,
+            clipboard_links: false,
             shortcut_request: 0,
             loading_shortcut: None,
             shortcut_editor: None,
@@ -289,7 +301,7 @@ impl CommandPalette {
         rows: Option<Vec<Row>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if page != self.page || query != self.query {
+        if page != self.search_page() || query != self.query {
             return false;
         }
         self.list.failed = rows.is_none();
@@ -319,7 +331,7 @@ impl CommandPalette {
         if self.page == Page::Clipboard
             && self
                 .selected()
-                .is_some_and(|row| row.entry.target == Target::Clip(id))
+                .is_some_and(|row| row.entry.target == Target::Clip(id, ClipKind::Image))
         {
             self.preview = image.map(|image| (id, image));
             cx.notify();
@@ -364,14 +376,28 @@ impl CommandPalette {
         }
         self.list.pending = true;
         self.list.failed = false;
-        self.send(Intent::Search(self.page, self.query.clone()));
+        self.send(Intent::Search(self.search_page(), self.query.clone()));
+    }
+
+    fn search_page(&self) -> Page {
+        if self.page == Page::Clipboard && self.clipboard_links {
+            Page::ClipboardLinks
+        } else {
+            self.page
+        }
+    }
+
+    fn toggle_clipboard_links(&mut self, cx: &mut Context<Self>) {
+        self.clipboard_links = !self.clipboard_links;
+        self.list.index = 0;
+        self.overlay = None;
+        self.request_search();
+        cx.notify();
     }
 
     fn request_preview(&mut self) {
-        if let Some(Target::Clip(id)) = self.selected().map(|row| &row.entry.target)
-            && self
-                .selected()
-                .is_some_and(|row| row.entry.detail == "PNG · 剪贴板图片")
+        if let Some(Target::Clip(id, ClipKind::Image)) =
+            self.selected().map(|row| &row.entry.target)
         {
             if self
                 .preview
@@ -538,6 +564,9 @@ impl CommandPalette {
             "n" if modifiers.control && self.page == Page::Shortcuts => {
                 self.new_shortcut(window, cx);
             }
+            "p" if modifiers.control && self.page == Page::Clipboard => {
+                self.toggle_clipboard_links(cx)
+            }
             "up" | "down" if self.page == Page::Settings => {
                 self.settings_index = if key == "down" {
                     (self.settings_index + 1).min(SettingsWindow::ITEMS.len() - 1)
@@ -640,13 +669,28 @@ impl CommandPalette {
 
     fn new_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shortcut_request = self.shortcut_request.wrapping_add(1);
-        self.open_shortcut_editor(self.shortcut_request, None, window, cx);
+        let draft = ShortcutDraft::new(ShortcutKind::Snippet, String::new());
+        self.open_shortcut_editor(self.shortcut_request, None, draft, window, cx);
+    }
+
+    pub fn create_shortcut_from_context(&mut self, kind: ShortcutKind, cx: &mut Context<Self>) {
+        self.load_shortcut(ShortcutSource::Context(kind), cx);
+    }
+
+    fn load_shortcut(&mut self, source: ShortcutSource, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.shortcut_request = self.shortcut_request.wrapping_add(1);
+        let request = self.shortcut_request;
+        self.loading_shortcut = Some(request);
+        self.send(Intent::LoadShortcut { request, source });
+        cx.notify();
     }
 
     fn open_shortcut_editor(
         &mut self,
         request: u64,
-        shortcut: Option<Shortcut>,
+        id: Option<i64>,
+        draft: ShortcutDraft,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -655,7 +699,7 @@ impl CommandPalette {
         self.set_compact(false, cx);
         self.overlay = None;
         self.loading_shortcut = None;
-        self.shortcut_editor = Some(ShortcutEditor::new(request, shortcut, &self.intents, cx));
+        self.shortcut_editor = Some(ShortcutEditor::new(request, id, draft, &self.intents, cx));
         self.focus(window, cx);
         cx.notify();
     }
@@ -663,7 +707,7 @@ impl CommandPalette {
     pub fn shortcut_loaded(
         &mut self,
         request: u64,
-        result: Result<Shortcut, String>,
+        result: Result<(Option<i64>, ShortcutDraft), String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -672,7 +716,7 @@ impl CommandPalette {
         }
         self.loading_shortcut = None;
         match result {
-            Ok(shortcut) => self.open_shortcut_editor(request, Some(shortcut), window, cx),
+            Ok((id, draft)) => self.open_shortcut_editor(request, id, draft, window, cx),
             Err(error) => self.toast(error, window, cx),
         }
     }
@@ -778,17 +822,13 @@ impl CommandPalette {
                     (Some(ResultAction::Run), _) => self.run_selected(false, cx),
                     (Some(ResultAction::Pin), _) => self.toggle_pin(cx),
                     (Some(ResultAction::EditShortcut), Target::Shortcut(id, _)) => {
-                        let id = *id;
-                        self.overlay = None;
-                        self.shortcut_request = self.shortcut_request.wrapping_add(1);
-                        self.loading_shortcut = Some(self.shortcut_request);
-                        self.send(Intent::LoadShortcut {
-                            request: self.shortcut_request,
-                            id,
-                        });
+                        self.load_shortcut(ShortcutSource::Existing(*id), cx);
                     }
                     (Some(ResultAction::DeleteShortcut), Target::Shortcut(id, _)) => {
                         self.overlay = Some(Overlay::ConfirmDeleteShortcut(*id));
+                    }
+                    (Some(ResultAction::SaveClipboardAs(kind)), Target::Clip(id, _)) => {
+                        self.load_shortcut(ShortcutSource::Clipboard(*id, *kind), cx);
                     }
                     _ => {}
                 }
@@ -861,7 +901,7 @@ fn next_item<T: Copy + PartialEq>(list: &[T], current: T, step: i32) -> T {
 fn can_pin(target: &Target) -> bool {
     matches!(
         target,
-        Target::App(_) | Target::Command(_) | Target::Clip(_) | Target::Shortcut(..)
+        Target::App(_) | Target::Command(_) | Target::Clip(..) | Target::Shortcut(..)
     )
 }
 
@@ -871,10 +911,13 @@ impl Render for CommandPalette {
         let (placeholder, icon) = match self.page {
             Page::Launcher => ("搜索应用、窗口和命令…", "\u{e721}"),
             Page::Windows => ("搜索运行中的窗口…", "\u{e737}"),
-            Page::Clipboard if self.settings.clipboard_ocr => {
+            Page::Clipboard | Page::ClipboardLinks if self.clipboard_links => {
+                ("搜索剪贴板链接…", "\u{e71b}")
+            }
+            Page::Clipboard | Page::ClipboardLinks if self.settings.clipboard_ocr => {
                 ("搜索剪贴板或图片内文字…", "\u{e77f}")
             }
-            Page::Clipboard => ("搜索剪贴板文字或图片…", "\u{e77f}"),
+            Page::Clipboard | Page::ClipboardLinks => ("搜索剪贴板文字或图片…", "\u{e77f}"),
             Page::Files => ("搜索 Windows 已索引的文件…", "\u{e8b7}"),
             Page::Shortcuts => ("搜索常用文本和快捷链接…", "\u{e734}"),
             Page::Settings => ("", "\u{e713}"),
@@ -912,11 +955,33 @@ impl Render for CommandPalette {
                 self.input.clone().into_any_element()
             })
             .when(editor.is_none() && self.page == Page::Shortcuts, |header| {
+                header
+                    .child(button("new-link", "新建链接", colors).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.create_shortcut_from_context(ShortcutKind::Quicklink, cx)
+                        },
+                    )))
+                    .child(
+                        button("new-shortcut", "新建文本", colors)
+                            .bg(colors.selected)
+                            .text_color(colors.accent)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.new_shortcut(window, cx)),
+                            ),
+                    )
+            })
+            .when(editor.is_none() && self.page == Page::Clipboard, |header| {
+                let text = if self.clipboard_links {
+                    "仅链接"
+                } else {
+                    "全部类型"
+                };
                 header.child(
-                    button("new-shortcut", "新建", colors)
-                        .bg(colors.selected)
-                        .text_color(colors.accent)
-                        .on_click(cx.listener(|this, _, window, cx| this.new_shortcut(window, cx))),
+                    button("clipboard-link-filter", text, colors)
+                        .when(self.clipboard_links, |button| {
+                            button.bg(colors.selected).text_color(colors.accent)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_clipboard_links(cx))),
                 )
             })
             .child(if editor.is_some() {
@@ -1028,6 +1093,8 @@ impl CommandPalette {
                 && self.query.is_empty()
             {
                 "剪贴板记录已暂停。可在设置中开启。"
+            } else if self.page == Page::Clipboard && self.clipboard_links {
+                "没有匹配的剪贴板链接"
             } else if self.page == Page::Clipboard && self.query.is_empty() {
                 "尚无剪贴板记录"
             } else if self.page == Page::Shortcuts && self.query.is_empty() {
@@ -1185,12 +1252,16 @@ impl ResultItem {
         palette: WeakEntity<CommandPalette>,
     ) -> Stateful<Div> {
         let icon = target_icon(&row.entry.target);
-        let subtitle = if matches!(row.entry.target, Target::Clip(_)) {
-            "剪贴板".into()
-        } else if let Target::Shortcut(_, kind) = row.entry.target {
-            kind.label().into()
+        let subtitle = match row.entry.target {
+            Target::Clip(_, ClipKind::Link) => "剪贴板链接".into(),
+            Target::Clip(..) => "剪贴板".into(),
+            Target::Shortcut(_, kind) => kind.label().into(),
+            _ => row.entry.detail.clone(),
+        };
+        let subtitle = if row.suggested {
+            format!("建议 · {subtitle}")
         } else {
-            row.entry.detail.clone()
+            subtitle
         };
         div()
             .id(("result", index))
@@ -1269,7 +1340,8 @@ impl PreviewPanel {
             Target::Window(_) => "运行窗口",
             Target::Command(_) => "命令",
             Target::CopyText(_) => "计算结果",
-            Target::Clip(_) => "剪贴板",
+            Target::Clip(_, ClipKind::Link) => "剪贴板链接",
+            Target::Clip(..) => "剪贴板",
             Target::Shortcut(_, kind) => kind.label(),
         };
         div()
@@ -1332,7 +1404,7 @@ impl ActionMenu {
                     for (index, action) in result_actions(&row.entry.target).iter().enumerate() {
                         let label = match action {
                             ResultAction::Run => match row.entry.target {
-                                Target::Clip(_)
+                                Target::Clip(..)
                                 | Target::CopyText(_)
                                 | Target::Shortcut(_, ShortcutKind::Snippet) => "复制",
                                 Target::File(_) => "打开文件",
@@ -1340,7 +1412,7 @@ impl ActionMenu {
                                 _ => "运行",
                             },
                             ResultAction::Pin => {
-                                match (matches!(row.entry.target, Target::Clip(_)), row.pinned) {
+                                match (matches!(row.entry.target, Target::Clip(..)), row.pinned) {
                                     (true, true) => "取消固定",
                                     (true, false) => "固定条目",
                                     (false, true) => "取消收藏",
@@ -1349,6 +1421,10 @@ impl ActionMenu {
                             }
                             ResultAction::EditShortcut => "编辑",
                             ResultAction::DeleteShortcut => "删除",
+                            ResultAction::SaveClipboardAs(ShortcutKind::Snippet) => "存为常用文本",
+                            ResultAction::SaveClipboardAs(ShortcutKind::Quicklink) => {
+                                "存为快捷链接"
+                            }
                         };
                         menu = menu.child(
                             button(("entry-action", index), label, colors)
@@ -1444,7 +1520,8 @@ fn target_icon(target: &Target) -> &'static str {
         Target::Window(_) => "\u{e737}",
         Target::Command(_) => "\u{e713}",
         Target::CopyText(_) => "\u{e8ef}",
-        Target::Clip(_) => "\u{e77f}",
+        Target::Clip(_, ClipKind::Link) => "\u{e71b}",
+        Target::Clip(..) => "\u{e77f}",
         Target::Shortcut(_, ShortcutKind::Snippet) => "\u{e8a5}",
         Target::Shortcut(_, ShortcutKind::Quicklink) => "\u{e71b}",
     }

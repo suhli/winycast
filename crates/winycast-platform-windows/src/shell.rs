@@ -20,7 +20,8 @@ use windows::{
         },
         System::{
             Com::{
-                COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
+                COINIT, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoInitializeEx,
+                CoTaskMemFree, CoUninitialize, IBindCtx,
             },
             Power::SetSuspendState,
             Threading::{
@@ -44,8 +45,16 @@ use winycast_core::{Entry, SystemCommand, Target, WindowTarget};
 pub(crate) struct Apartment;
 impl Apartment {
     pub(crate) fn enter() -> Result<Self> {
+        Self::initialize(COINIT_APARTMENTTHREADED)
+    }
+
+    pub(crate) fn multithreaded() -> Result<Self> {
+        Self::initialize(COINIT_MULTITHREADED)
+    }
+
+    fn initialize(mode: COINIT) -> Result<Self> {
         unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            CoInitializeEx(None, mode).ok()?;
         }
         Ok(Self)
     }
